@@ -7,6 +7,30 @@ from ..exceptions import JLinkMCPError, JLinkErrorCode
 from ..models.operations import FlashEraseRequest, FlashProgramRequest
 from ..utils import logger, human_readable_size, parse_hex_string
 
+# 校验失败时最多返回的不匹配条数（避免大固件校验失败时输出几 MB 的 mismatch 列表）
+_MAX_MISMATCHES = 100
+
+
+def _build_verify_result(data_bytes, read_back_bytes, address):
+    """比较期望数据与实际读回数据，生成校验结果（不匹配项截断到 _MAX_MISMATCHES）."""
+    if read_back_bytes == data_bytes:
+        return {"matched": True, "mismatches": [], "mismatch_count": 0}
+
+    total = 0
+    mismatches = []
+    for i, (a, b) in enumerate(zip(data_bytes, read_back_bytes)):
+        if a != b:
+            total += 1
+            if len(mismatches) < _MAX_MISMATCHES:
+                mismatches.append({"address": address + i, "expected": a, "actual": b})
+
+    return {
+        "matched": False,
+        "mismatches": mismatches,
+        "mismatch_count": total,
+        "truncated": total > _MAX_MISMATCHES,
+    }
+
 
 def erase_flash(
     start_address: Optional[int] = None,
@@ -222,25 +246,21 @@ def program_flash(address: int, data: str | None = None, verify: bool = True, fi
             read_back = jlink.memory_read(address, len(data_bytes))
             read_back_bytes = bytes(read_back)  # 统一为 bytes，避免 list/bytes 比较恒为 False
 
-            if read_back_bytes == data_bytes:
-                verify_result = {"matched": True, "mismatches": []}
+            verify_result = _build_verify_result(data_bytes, read_back_bytes, address)
+            if verify_result["matched"]:
                 logger.info("Flash 校验成功")
             else:
-                # 找出不匹配的位置
-                mismatches = []
-                for i, (a, b) in enumerate(zip(data_bytes, read_back_bytes)):
-                    if a != b:
-                        mismatches.append({"address": address + i, "expected": a, "actual": b})
-
-                verify_result = {"matched": False, "mismatches": mismatches}
-                logger.warning(f"Flash 校验失败，{len(mismatches)} 处不匹配")
+                logger.warning(f"Flash 校验失败，{verify_result['mismatch_count']} 处不匹配")
 
         logger.info("Flash 烧录成功")
+        msg = f"成功烧录 {human_readable_size(len(data_bytes))} 到 Flash"
+        if verify_result is not None and not verify_result["matched"]:
+            msg += f"（但校验失败：{verify_result['mismatch_count']} 处不匹配）"
         return {
             "success": True,
             "bytes_programmed": len(data_bytes),
             "verify_result": verify_result,
-            "message": f"成功烧录 {human_readable_size(len(data_bytes))} 到 Flash"
+            "message": msg
         }
     except JLinkMCPError as e:
         logger.error(f"烧录 Flash 失败: {e}")
@@ -288,31 +308,26 @@ def verify_flash(address: int, data: str) -> Dict[str, Any]:
         read_back = jlink.memory_read(address, len(data_bytes))
         read_back_bytes = bytes(read_back)  # 统一为 bytes，避免 list/bytes 比较恒为 False
 
-        if read_back_bytes == data_bytes:
+        verify_result = _build_verify_result(data_bytes, read_back_bytes, address)
+
+        if verify_result["matched"]:
             logger.info(f"Flash 校验成功（{len(data_bytes)} 字节）")
             return {
                 "success": True,
                 "matched": True,
                 "mismatches": [],
+                "mismatch_count": 0,
                 "message": f"Flash 校验成功（{len(data_bytes)} 字节）"
             }
         else:
-            # 找出不匹配的位置
-            mismatches = []
-            for i, (a, b) in enumerate(zip(data_bytes, read_back_bytes)):
-                if a != b:
-                    mismatches.append({
-                        "address": address + i,
-                        "expected": a,
-                        "actual": b
-                    })
-
-            logger.warning(f"Flash 校验失败，{len(mismatches)} 处不匹配")
+            logger.warning(f"Flash 校验失败，{verify_result['mismatch_count']} 处不匹配")
             return {
                 "success": True,
                 "matched": False,
-                "mismatches": mismatches,
-                "message": f"Flash 校验失败，{len(mismatches)} 处不匹配"
+                "mismatches": verify_result["mismatches"],
+                "mismatch_count": verify_result["mismatch_count"],
+                "truncated": verify_result["truncated"],
+                "message": f"Flash 校验失败，{verify_result['mismatch_count']} 处不匹配"
             }
     except JLinkMCPError as e:
         logger.error(f"校验 Flash 失败: {e}")
