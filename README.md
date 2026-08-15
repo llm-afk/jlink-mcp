@@ -70,7 +70,7 @@ $env:JLINK_LIB_PATH = "D:\Program Files\SEGGER\JLink_V942\JLink_x64.dll"
 
 ## SVD 文件管理
 
-项目内置了 `GD32C10x.svd`（位于 `jlink_mcp/tool/SVD_V1.5.6/`），用于外设寄存器的解析与字段展示。SVD 文件查找规则：
+项目内置了 `GD32C10x.svd` 以及 `N32H473.svd` / `N32H474.svd` / `N32H475.svd`（均位于 `jlink_mcp/tool/SVD_V1.5.6/`），用于外设寄存器的解析与字段展示。SVD 文件查找规则：
 
 1. 优先使用环境变量 `JLINK_SVD_DIR` 指定的目录；
 2. 否则使用包内目录 `jlink_mcp/tool/SVD_V1.5.6/`。
