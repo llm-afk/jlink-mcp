@@ -19,7 +19,8 @@ _rtt_config = {
 def rtt_start(
     buffer_index: int = 0,
     read_mode: str = "continuous",
-    timeout_ms: int = 1000
+    timeout_ms: int = 1000,
+    block_address: Optional[int] = None
 ) -> Dict[str, Any]:
     """启动 RTT.
 
@@ -34,7 +35,7 @@ def rtt_start(
         - buffer_index: 缓冲区索引
         - message: 状态信息
     """
-    global _rtt_started, _rttt_config
+    global _rtt_started, _rtt_config
 
     try:
         if _rtt_started:
@@ -47,8 +48,8 @@ def rtt_start(
         jlink = jlink_manager.get_jlink()
 
         # 配置 RTT
-        logger.info(f"启动 RTT，缓冲区索引: {buffer_index}")
-        jlink.rtt_start(buffer_index)
+        logger.info(f"启动 RTT，缓冲区索引: {buffer_index}, 控制块地址: {block_address}")
+        jlink.rtt_start(block_address)
 
         _rtt_started = True
         _rtt_config = {
@@ -159,12 +160,8 @@ def rtt_read(
 
         jlink = jlink_manager.get_jlink()
 
-        # 使用配置的超时时间
-        if timeout_ms is None:
-            timeout_ms = _rtt_config.get("timeout_ms", 1000)
-
-        # 读取 RTT 数据
-        data = jlink.rtt_read(buffer_index, size, timeout_ms)
+        # 读取 RTT 数据（pylink 的 rtt_read 仅支持 buffer_index 和 num_bytes 两个参数）
+        data = jlink.rtt_read(buffer_index, size)
 
         if data:
             # 尝试解码为字符串
@@ -242,6 +239,12 @@ def rtt_write(data: str, buffer_index: int = 0) -> Dict[str, Any]:
         bytes_written = jlink.rtt_write(buffer_index, data_bytes)
 
         logger.info(f"RTT 写入 {bytes_written} 字节")
+        if bytes_written == 0:
+            return {
+                "success": True,
+                "bytes_written": 0,
+                "message": f"写入 0 字节：缓冲区 {buffer_index} 可能是上行通道（target→host）或未配置下行通道，无法从 host 写入"
+            }
         return {
             "success": True,
             "bytes_written": bytes_written,

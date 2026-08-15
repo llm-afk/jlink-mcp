@@ -154,6 +154,12 @@ class JLinkManager:
                 logger.info("正在连接第一个可用设备")
                 self._jlink.open()
 
+            # 禁用 J-Link 对话框弹窗（erase/flash 等操作时不再弹出 GUI 窗口）
+            try:
+                self._jlink.disable_dialog_boxes()
+            except Exception as e:
+                logger.warning(f"禁用对话框失败（可忽略）: {e}")
+
             # 设置接口类型
             self._target_interface = interface
             if interface == TargetInterface.SWD:

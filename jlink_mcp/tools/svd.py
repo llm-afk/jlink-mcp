@@ -381,3 +381,162 @@ def parse_register_value(
                 "description": str(e)
             }
         }
+
+
+def read_register_by_address(
+    address: int,
+    width: int = 32,
+    device_name: str | None = None
+) -> Dict[str, Any]:
+    """按地址直接读取寄存器值（不依赖 SVD）.
+
+    无需 SVD 文件即可按绝对地址读取寄存器值。
+    如果同时提供 device_name 且 SVD 可用，会尝试反查该地址对应的
+    外设/寄存器名称并解析字段（best-effort，反查失败不影响读取）。
+
+    Args:
+        address: 寄存器绝对地址
+        width: 访问宽度（8/16/32位，默认 32）
+        device_name: 可选，用于反查寄存器名和字段解析
+
+    Returns:
+        - success, address, raw_value, hex_value, binary_value, width
+        - peripheral_name/register_name/fields（仅当反查成功时附加）
+    """
+    try:
+        if width not in (8, 16, 32):
+            raise JLinkMCPError(
+                JLinkErrorCode.INVALID_PARAMETER,
+                f"宽度必须是 8/16/32: {width}"
+            )
+
+        num_bytes = width // 8
+
+        jlink = jlink_manager.get_jlink()
+
+        # 目标运行中时先暂停，避免 -3 读取失败
+        try:
+            if hasattr(jlink, 'halted') and not jlink.halted():
+                logger.warning(f"目标正在运行，暂停后读取地址 {address:#x}")
+                jlink.halt()
+        except Exception:
+            pass
+
+        data = jlink.memory_read(address, num_bytes)
+        raw_value = int.from_bytes(data, byteorder='little')
+
+        result = {
+            "success": True,
+            "address": f"0x{address:X}",
+            "raw_value": raw_value,
+            "hex_value": f"0x{raw_value:X}",
+            "binary_value": format(raw_value, f'0{width}b'),
+            "width": width
+        }
+
+        # 可选：通过 SVD 反查寄存器名和字段
+        if device_name and svd_manager.is_available():
+            found = svd_manager.find_register_by_address(device_name, address)
+            if found:
+                peripheral, register = found
+                parsed = svd_manager.parse_register_value(
+                    device_name, peripheral.name, register.name, raw_value
+                )
+                if parsed:
+                    result["peripheral_name"] = peripheral.name
+                    result["register_name"] = register.name
+                    result["register_description"] = register.description
+                    result["fields"] = parsed.get("fields", [])
+                    result["field_count"] = len(result["fields"])
+
+        logger.info(f"按地址读取寄存器 {address:#x} = {raw_value:#x}")
+        return result
+    except JLinkMCPError as e:
+        logger.error(f"按地址读取寄存器失败: {e}")
+        return {
+            "success": False,
+            "address": f"0x{address:X}",
+            "raw_value": None,
+            "hex_value": None,
+            "error": e.to_dict()
+        }
+    except Exception as e:
+        logger.error(f"按地址读取寄存器失败: {e}")
+        return {
+            "success": False,
+            "address": f"0x{address:X}",
+            "raw_value": None,
+            "hex_value": None,
+            "error": {
+                "code": JLinkErrorCode.READ_FAILED.value[0],
+                "description": str(e),
+                "suggestion": "请检查地址是否有效，目标是否已暂停"
+            }
+        }
+
+
+def write_register_by_address(
+    address: int,
+    value: int,
+    width: int = 32
+) -> Dict[str, Any]:
+    """按地址直接写入寄存器值（不依赖 SVD）.
+
+    无需 SVD 文件即可按绝对地址写入寄存器值。
+
+    Args:
+        address: 寄存器绝对地址
+        value: 要写入的值
+        width: 访问宽度（8/16/32位，默认 32）
+
+    Returns:
+        - success, address, value, hex_value, width
+    """
+    try:
+        if width not in (8, 16, 32):
+            raise JLinkMCPError(
+                JLinkErrorCode.INVALID_PARAMETER,
+                f"宽度必须是 8/16/32: {width}"
+            )
+        if value < 0 or value >= (1 << width):
+            raise JLinkMCPError(
+                JLinkErrorCode.INVALID_PARAMETER,
+                f"值 {value} 超出 {width} 位范围 [0, {(1 << width) - 1}]"
+            )
+
+        num_bytes = width // 8
+        data = value.to_bytes(num_bytes, byteorder='little')
+
+        jlink = jlink_manager.get_jlink()
+        jlink.memory_write(address, data)
+
+        logger.info(f"按地址写入寄存器 {address:#x} = {value:#x}")
+
+        return {
+            "success": True,
+            "address": f"0x{address:X}",
+            "value": value,
+            "hex_value": f"0x{value:X}",
+            "width": width,
+            "message": f"成功写入 {value:#x} 到地址 {address:#x}"
+        }
+    except JLinkMCPError as e:
+        logger.error(f"按地址写入寄存器失败: {e}")
+        return {
+            "success": False,
+            "address": f"0x{address:X}",
+            "value": value,
+            "error": e.to_dict()
+        }
+    except Exception as e:
+        logger.error(f"按地址写入寄存器失败: {e}")
+        return {
+            "success": False,
+            "address": f"0x{address:X}",
+            "value": value,
+            "error": {
+                "code": JLinkErrorCode.WRITE_FAILED.value[0],
+                "description": str(e),
+                "suggestion": "请检查地址是否有效，寄存器是否可写"
+            }
+        }

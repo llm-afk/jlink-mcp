@@ -200,13 +200,27 @@ class GDBServerManager:
     def _find_jlink_gdbserver_exe(self) -> Optional[str]:
         """查找 JLinkGDBServer.exe 可执行文件.
 
+        查找顺序：
+        1. JLINK_LIB_PATH 环境变量（从 DLL 目录推导 exe，支持非默认安装路径）
+        2. 系统 PATH
+        3. 常见安装路径（含不同盘符与版本号后缀目录，如 JLink_V942）
+
         Returns:
             可执行文件路径，如果未找到则返回 None
         """
-        import subprocess
         import os
+        import subprocess
 
-        # 尝试从 PATH 查找
+        candidates = []
+
+        # 1. 从 JLINK_LIB_PATH 环境变量推导（与 jlink_manager 一致的 DLL 定位方式）
+        lib_path_env = os.environ.get("JLINK_LIB_PATH")
+        if lib_path_env:
+            base_dir = os.path.dirname(lib_path_env) if os.path.isfile(lib_path_env) else lib_path_env
+            candidates.append(os.path.join(base_dir, "JLinkGDBServer.exe"))
+            candidates.append(os.path.join(base_dir, "JLinkGDBServerCL.exe"))
+
+        # 2. 从系统 PATH 查找
         try:
             result = subprocess.run(
                 ["where", "JLinkGDBServer.exe"],
@@ -215,19 +229,34 @@ class GDBServerManager:
                 timeout=5
             )
             if result.returncode == 0:
-                return result.stdout.strip().split('\n')[0]
+                path = result.stdout.strip().split('\n')[0].strip()
+                if path:
+                    candidates.append(path)
         except Exception:
             pass
 
-        # 尝试常见安装路径
-        common_paths = [
-            r"C:\Program Files\SEGGER\JLink",
-            r"C:\Program Files (x86)\SEGGER\JLink",
+        # 3. 常见安装路径（覆盖 C/D 盘及带版本号后缀的 JLink_Vxxx 目录）
+        base_dirs = [
+            r"C:\Program Files\SEGGER",
+            r"C:\Program Files (x86)\SEGGER",
+            r"D:\Program Files\SEGGER",
+            r"D:\Program Files (x86)\SEGGER",
         ]
+        for base in base_dirs:
+            if not os.path.isdir(base):
+                continue
+            # 直接子目录（如 JLink、JLink_V942）
+            try:
+                for entry in os.listdir(base):
+                    if entry.lower().startswith("jlink") and os.path.isdir(os.path.join(base, entry)):
+                        candidates.append(os.path.join(base, entry, "JLinkGDBServer.exe"))
+            except Exception:
+                pass
+            candidates.append(os.path.join(base, "JLinkGDBServer.exe"))
 
-        for base_path in common_paths:
-            exe_path = os.path.join(base_path, "JLinkGDBServer.exe")
-            if os.path.exists(exe_path):
+        # 依次检查候选路径
+        for exe_path in candidates:
+            if exe_path and os.path.isfile(exe_path):
                 return exe_path
 
         return None

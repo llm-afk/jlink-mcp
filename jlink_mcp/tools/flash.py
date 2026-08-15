@@ -5,7 +5,7 @@ from typing import Dict, Any, Optional
 from ..jlink_manager import jlink_manager
 from ..exceptions import JLinkMCPError, JLinkErrorCode
 from ..models.operations import FlashEraseRequest, FlashProgramRequest
-from ..utils import logger, human_readable_size
+from ..utils import logger, human_readable_size, parse_hex_string
 
 
 def erase_flash(
@@ -86,7 +86,7 @@ def erase_flash(
         }
 
 
-def program_flash(address: int, data: bytes, verify: bool = True) -> Dict[str, Any]:
+def program_flash(address: int, data: str | None = None, verify: bool = True, file_path: str | None = None) -> Dict[str, Any]:
     """烧录固件到 Flash.
 
     Args:
@@ -102,27 +102,34 @@ def program_flash(address: int, data: bytes, verify: bool = True) -> Dict[str, A
         - message: 状态信息
     """
     try:
-        if not data:
-            raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, "数据不能为空")
+        # 解析烧录数据：优先从文件读取，否则解析 hex 字符串
+        if file_path:
+            with open(file_path, 'rb') as f:
+                data_bytes = f.read()
+        elif data:
+            data_bytes = parse_hex_string(data)
+        else:
+            raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, "必须提供 data 或 file_path")
 
         jlink = jlink_manager.get_jlink()
 
-        logger.info(f"烧录 Flash {address:#x} 大小 {human_readable_size(len(data))}")
-        jlink.flash(data, address)
+        logger.info(f"烧录 Flash {address:#x} 大小 {human_readable_size(len(data_bytes))}")
+        jlink.flash(data_bytes, address)
 
         verify_result = None
         if verify:
             # 校验
             logger.info("校验 Flash")
-            read_back = jlink.memory_read(address, len(data))
+            read_back = jlink.memory_read(address, len(data_bytes))
+            read_back_bytes = bytes(read_back)  # 统一为 bytes，避免 list/bytes 比较恒为 False
 
-            if read_back == data:
+            if read_back_bytes == data_bytes:
                 verify_result = {"matched": True, "mismatches": []}
                 logger.info("Flash 校验成功")
             else:
                 # 找出不匹配的位置
                 mismatches = []
-                for i, (a, b) in enumerate(zip(data, read_back)):
+                for i, (a, b) in enumerate(zip(data_bytes, read_back_bytes)):
                     if a != b:
                         mismatches.append({"address": address + i, "expected": a, "actual": b})
 
@@ -132,9 +139,9 @@ def program_flash(address: int, data: bytes, verify: bool = True) -> Dict[str, A
         logger.info("Flash 烧录成功")
         return {
             "success": True,
-            "bytes_programmed": len(data),
+            "bytes_programmed": len(data_bytes),
             "verify_result": verify_result,
-            "message": f"成功烧录 {human_readable_size(len(data))} 到 Flash"
+            "message": f"成功烧录 {human_readable_size(len(data_bytes))} 到 Flash"
         }
     except JLinkMCPError as e:
         logger.error(f"烧录 Flash 失败: {e}")
@@ -158,7 +165,7 @@ def program_flash(address: int, data: bytes, verify: bool = True) -> Dict[str, A
         }
 
 
-def verify_flash(address: int, data: bytes) -> Dict[str, Any]:
+def verify_flash(address: int, data: str) -> Dict[str, Any]:
     """校验 Flash 内容.
 
     Args:
@@ -176,21 +183,24 @@ def verify_flash(address: int, data: bytes) -> Dict[str, Any]:
         if not data:
             raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, "数据不能为空")
 
-        jlink = jlink_manager.get_jlink()
-        read_back = jlink.memory_read(address, len(data))
+        data_bytes = parse_hex_string(data)
 
-        if read_back == data:
-            logger.info(f"Flash 校验成功（{len(data)} 字节）")
+        jlink = jlink_manager.get_jlink()
+        read_back = jlink.memory_read(address, len(data_bytes))
+        read_back_bytes = bytes(read_back)  # 统一为 bytes，避免 list/bytes 比较恒为 False
+
+        if read_back_bytes == data_bytes:
+            logger.info(f"Flash 校验成功（{len(data_bytes)} 字节）")
             return {
                 "success": True,
                 "matched": True,
                 "mismatches": [],
-                "message": f"Flash 校验成功（{len(data)} 字节）"
+                "message": f"Flash 校验成功（{len(data_bytes)} 字节）"
             }
         else:
             # 找出不匹配的位置
             mismatches = []
-            for i, (a, b) in enumerate(zip(data, read_back)):
+            for i, (a, b) in enumerate(zip(data_bytes, read_back_bytes)):
                 if a != b:
                     mismatches.append({
                         "address": address + i,

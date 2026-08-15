@@ -36,7 +36,7 @@ class SVDManager:
     _initialized: bool = False
 
     # 缓存版本号，当模型结构变化时需要更新
-    CACHE_VERSION = 2
+    CACHE_VERSION = 3
 
     def __new__(cls) -> "SVDManager":
         if cls._instance is None:
@@ -269,11 +269,29 @@ class SVDManager:
             peripherals=[]
         )
 
-        # 解析外设
+        # 解析外设（两遍：先解析所有外设，再展开 derivedFrom 继承的寄存器）
         peripherals = root.find("peripherals")
         if peripherals is not None:
-            for peripheral in peripherals.findall("peripheral"):
+            peripheral_elements = peripherals.findall("peripheral")
+            derived_from_map = {}
+
+            # 第一遍：解析所有外设，并记录 derivedFrom 关系
+            for peripheral in peripheral_elements:
+                name = peripheral.findtext("name", "")
+                derived = peripheral.get("derivedFrom")
+                if derived:
+                    derived_from_map[name] = derived
                 device.peripherals.append(self._parse_peripheral(peripheral))
+
+            # 第二遍：展开 derivedFrom（继承目标外设的寄存器，如 GPIOB derivedFrom GPIOA）
+            if derived_from_map:
+                name_to_peripheral = {p.name: p for p in device.peripherals}
+                for name, derived in derived_from_map.items():
+                    target = name_to_peripheral.get(derived)
+                    peripheral = name_to_peripheral.get(name)
+                    if target and peripheral and not peripheral.registers:
+                        peripheral.registers = list(target.registers)
+                        logger.debug(f"外设 {name} 从 {derived} 继承了 {len(peripheral.registers)} 个寄存器")
 
         return device
 
@@ -503,6 +521,37 @@ class SVDManager:
             "binary_value": format(value, f'0{register.size}b'),
             "fields": field_results
         }
+
+    def find_register_by_address(
+        self,
+        device_name: str,
+        address: int
+    ) -> Optional[Tuple[PeripheralInfo, RegisterInfo]]:
+        """按绝对地址反查寄存器（外设基地址 + 寄存器偏移）.
+
+        不依赖寄存器名称，遍历所有外设定位绝对地址对应的寄存器。
+        用于「手动指定地址」场景：只给地址，反查出外设/寄存器名以便解析字段。
+
+        Args:
+            device_name: 设备名称
+            address: 寄存器绝对地址
+
+        Returns:
+            (外设, 寄存器) 元组，未找到返回 None
+        """
+        if not self._ensure_device_loaded(device_name):
+            return None
+
+        actual_name = self._find_matching_device(device_name) or device_name
+        device = self._devices.get(actual_name)
+        if not device:
+            return None
+
+        for peripheral in device.peripherals:
+            for register in peripheral.registers:
+                if peripheral.base_address + register.address_offset == address:
+                    return peripheral, register
+        return None
 
     def clear_cache(self) -> None:
         """清除查询缓存."""

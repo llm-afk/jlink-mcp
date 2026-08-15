@@ -304,6 +304,59 @@ BEST_PRACTICES = {
             "❌ 忽略 BTE 位，使用错误的寄存器",
             "✅ BTE=0 用 CTRL1/CBT，BTE=1 用 EPRS/ENCBT/EDCBT"
         ]
+    },
+    "flash_operations": {
+        "title": "Flash 操作最佳实践",
+        "recommended_flow": [
+            "1. connect_device(chip_name, interface) - 连接设备",
+            "2. halt_cpu() - 暂停 CPU（Flash 操作前建议暂停）",
+            "3. erase_flash(chip_erase=True) - 整片擦除（或指定范围）",
+            "4. program_flash(address, data, verify=True) - 烧录固件",
+            "5. verify_flash(address, data) - 校验烧录结果（可选）"
+        ],
+        "forbidden": [
+            "禁止在未擦除的情况下向已写入区域重复烧录（Flash 只能 1→0）",
+            "禁止烧录到非 Flash 地址（如 RAM/外设区）",
+            "禁止在烧录失败后直接运行 CPU（先确认烧录完整性）"
+        ],
+        "performance_tips": [
+            "使用 file_path 参数从 .bin/.hex 文件烧录，避免传输超大数据",
+            "烧录大固件时关闭 verify 可提速（烧录后再单独校验一次）",
+            "整片擦除比多次分扇区擦除更快"
+        ],
+        "common_mistakes": [
+            "❌ 忘记先擦除就烧录（写非 0xFF 区域会失败）",
+            "✅ 先 erase_flash 再 program_flash",
+            "❌ 烧录后未校验就复位运行",
+            "✅ 使用 verify=True 或单独调用 verify_flash"
+        ]
+    },
+    "debug": {
+        "title": "调试控制最佳实践",
+        "recommended_flow": [
+            "1. connect_device(chip_name, interface) - 连接设备",
+            "2. reset_target(reset_type='halt') - 复位并暂停",
+            "3. set_breakpoint(address) - 在关键位置设置断点",
+            "4. run_cpu() - 运行到断点",
+            "5. read_registers() / get_cpu_state() - 查看状态",
+            "6. step_instruction() - 单步执行",
+            "7. clear_breakpoint(address) - 调试完成后清除断点"
+        ],
+        "forbidden": [
+            "禁止在 CPU 运行时设置断点（先 halt_cpu）",
+            "禁止忘记清除断点（可能影响后续运行）",
+            "禁止在复位后不确认状态就继续操作"
+        ],
+        "performance_tips": [
+            "使用 halt_cpu 后再批量读取寄存器，避免重复暂停",
+            "断点命中后先看 PC 和调用栈，再决定单步方向"
+        ],
+        "common_mistakes": [
+            "❌ 运行态直接读寄存器（值不准确）",
+            "✅ 先 halt_cpu 再读",
+            "❌ 单步前不确认已在暂停态",
+            "✅ 先 get_cpu_state 确认 halted=true"
+        ]
     }
 }
 

@@ -69,6 +69,8 @@ from .tools.svd import (
     get_svd_registers as _get_svd_registers,
     read_register_with_fields as _read_register_with_fields,
     parse_register_value as _parse_register_value,
+    read_register_by_address as _read_register_by_address,
+    write_register_by_address as _write_register_by_address,
 )
 from .tools.guidance import (
     get_usage_guidance as _get_usage_guidance,
@@ -227,7 +229,7 @@ async def read_memory(address: int, size: int, width: int = 32) -> dict:
 
 
 @mcp.tool()
-async def write_memory(address: int, data: bytes, width: int = 32) -> dict:
+async def write_memory(address: int, data: str, width: int = 32) -> dict:
     """写入内存.
 
     Args:
@@ -292,7 +294,7 @@ async def erase_flash(
 
 
 @mcp.tool()
-async def program_flash(address: int, data: bytes, verify: bool = True) -> dict:
+async def program_flash(address: int, data: str | None = None, verify: bool = True, file_path: str | None = None) -> dict:
     """烧录固件到 Flash.
 
     Args:
@@ -307,7 +309,7 @@ async def program_flash(address: int, data: bytes, verify: bool = True) -> dict:
 
 
 @mcp.tool()
-async def verify_flash(address: int, data: bytes) -> dict:
+async def verify_flash(address: int, data: str) -> dict:
     """校验 Flash 内容.
 
     Args:
@@ -607,6 +609,50 @@ async def parse_register_value(
         寄存器值和字段解析结果
     """
     return _parse_register_value(device_name, peripheral_name, register_name, value)
+
+
+@mcp.tool()
+async def read_register_by_address(
+    address: int,
+    width: int = 32,
+    device_name: str | None = None
+) -> dict:
+    """按地址直接读取寄存器值（不依赖 SVD）.
+
+    无需 SVD 文件即可按绝对地址读取寄存器值。
+    如果同时提供 device_name 且 SVD 可用，会尝试反查该地址对应的
+    外设/寄存器名称并解析字段。
+
+    Args:
+        address: 寄存器绝对地址
+        width: 访问宽度（8/16/32位，默认 32）
+        device_name: 可选，用于反查寄存器名和字段解析
+
+    Returns:
+        寄存器值和可选的字段解析结果
+    """
+    return _read_register_by_address(address, width, device_name)
+
+
+@mcp.tool()
+async def write_register_by_address(
+    address: int,
+    value: int,
+    width: int = 32
+) -> dict:
+    """按地址直接写入寄存器值（不依赖 SVD）.
+
+    无需 SVD 文件即可按绝对地址写入寄存器值。
+
+    Args:
+        address: 寄存器绝对地址
+        value: 要写入的值
+        width: 访问宽度（8/16/32位，默认 32）
+
+    Returns:
+        写入结果
+    """
+    return _write_register_by_address(address, value, width)
 
 
 # ========================================

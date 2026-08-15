@@ -6,7 +6,7 @@ from typing import Dict, Any, List, Optional
 from ..jlink_manager import jlink_manager
 from ..exceptions import JLinkMCPError, JLinkErrorCode
 from ..models.operations import MemoryReadRequest, MemoryWriteRequest, RegisterReadResult
-from ..utils import logger, validate_address, format_bytes
+from ..utils import logger, validate_address, format_bytes, parse_hex_string
 
 
 def read_memory(address: int, size: int, width: int = 32) -> Dict[str, Any]:
@@ -95,7 +95,7 @@ def read_memory(address: int, size: int, width: int = 32) -> Dict[str, Any]:
         }
 
 
-def write_memory(address: int, data: bytes, width: int = 32) -> Dict[str, Any]:
+def write_memory(address: int, data: str, width: int = 32) -> Dict[str, Any]:
     """写入内存.
 
     Args:
@@ -113,17 +113,19 @@ def write_memory(address: int, data: bytes, width: int = 32) -> Dict[str, Any]:
         if not data:
             raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, "数据不能为空")
 
+        data_bytes = parse_hex_string(data)
+
         validate_address(address, width // 8)
 
         jlink = jlink_manager.get_jlink()
-        jlink.memory_write(address, data)
+        jlink.memory_write(address, data_bytes)
 
-        logger.info(f"写入内存 {address:#x} 大小 {len(data)} 字节成功")
+        logger.info(f"写入内存 {address:#x} 大小 {len(data_bytes)} 字节成功")
 
         return {
             "success": True,
-            "bytes_written": len(data),
-            "message": f"成功写入 {len(data)} 字节到地址 {address:#x}"
+            "bytes_written": len(data_bytes),
+            "message": f"成功写入 {len(data_bytes)} 字节到地址 {address:#x}"
         }
     except JLinkMCPError as e:
         logger.error(f"写入内存失败: {e}")
@@ -174,7 +176,7 @@ def read_registers(register_names: Optional[List[str]] = None) -> Dict[str, Any]
             for name in register_names:
                 try:
                     value = jlink.register_read(name)
-                    registers.append({"name": name, "value": value})
+                    registers.append({"name": name, "value": value & 0xFFFFFFFF if isinstance(value, int) else value})
                 except Exception as e:
                     logger.warning(f"读取寄存器 {name} 失败: {e}")
         else:
@@ -189,7 +191,7 @@ def read_registers(register_names: Optional[List[str]] = None) -> Dict[str, Any]
             for name in register_list:
                 try:
                     value = jlink.register_read(name)
-                    registers.append({"name": name, "value": value})
+                    registers.append({"name": name, "value": value & 0xFFFFFFFF if isinstance(value, int) else value})
                 except Exception as e:
                     logger.debug(f"寄存器 {name} 不可用: {e}")
 
