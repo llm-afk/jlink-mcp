@@ -92,20 +92,19 @@ def erase_flash(
 def erase_sector(address: int, count: int = 1, page_size: int = 1024) -> Dict[str, Any]:
     """按扇区（页）擦除 Flash.
 
-    通过 J-Link 原生 Flash 下载算法实现页擦除：向目标扇区写入全 0xFF。
-    J-Link 在下载前会先擦除目标扇区，写入 0xFF（擦除态）等效于擦除，
-    从而只清除指定扇区、不触碰其余 Flash。
+    通过 J-Link 原生 Flash 下载算法实现扇区擦除：向目标区域写入全 0xFF。
+    J-Link 会按所连接芯片的 Flash 扇区布局先擦除目标扇区，写入 0xFF（即
+    擦除态）等效于擦除，从而只清除指定扇区、不触碰其余 Flash。
 
-    实现说明：GD32C10x 等芯片的 FMC 页擦除命令（PER + START）若经调试器
-    AHB-AP 直接写寄存器触发，FMC 会置 ENDF 但实际不擦除（GigaDevice 特有
-    行为，实测 FMC 编程 PG 经 AHB-AP 正常、页擦除 PER 不生效）。因此这里
-    复用 J-Link 的 RAM 驻留 Flash 算法（即 pylink 的 ``flash()``），用写入
-    全 0xFF 的方式可靠地实现扇区擦除。
+    通用性说明：本接口不依赖任何具体芯片的寄存器，而是复用 J-Link 的设备
+    Flash 算法（RAM 驻留 loader，即 pylink 的 ``flash()``），因此对 J-Link
+    支持的 Cortex-M 芯片（GD32 / STM32 / nRF 等）均通用。``page_size`` 仅
+    用于对齐与计算擦除字节数，实际擦除粒度由 J-Link 按设备扇区大小决定。
 
     Args:
-        address: 要擦除页内的任意地址（会自动对齐到页边界）
+        address: 要擦除区域内的任意地址（会自动对齐到 page_size 边界）
         count: 连续擦除的页数（默认 1）
-        page_size: 页大小（字节，默认 1024，GD32C10x 为 1KB）
+        page_size: 页大小（字节，默认 1024）
 
     Returns:
         包含以下字段的字典:
