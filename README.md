@@ -68,6 +68,17 @@ $env:JLINK_LIB_PATH = "D:\Program Files\SEGGER\JLink_V942\JLink_x64.dll"
 
 ---
 
+## SVD 文件管理
+
+项目内置了 `GD32C10x.svd`（位于 `jlink_mcp/tool/SVD_V1.5.6/`），用于外设寄存器的解析与字段展示。SVD 文件查找规则：
+
+1. 优先使用环境变量 `JLINK_SVD_DIR` 指定的目录；
+2. 否则使用包内目录 `jlink_mcp/tool/SVD_V1.5.6/`。
+
+**添加新 MCU 的 SVD**：把 `.svd` 文件放到 `jlink_mcp/tool/SVD_V1.5.6/` 目录下（文件名即设备名，例如 `STM32F407.svd` 对应 `get_svd_peripherals(device_name="STM32F407")`），或设置 `JLINK_SVD_DIR` 指向自定义目录。首次访问时会自动解析并生成 `.svd_cache/` 缓存（已加入 `.gitignore`），缓存可随时删除，会自动重建。
+
+---
+
 ## 快速开始
 
 ### 1. 直接启动
@@ -122,6 +133,15 @@ run_cpu()
 - SVD：`get_svd_peripherals` `get_svd_registers` `parse_register_value` `read_register_with_fields` `list_svd_devices`
 - GDB：`start_gdb_server` `stop_gdb_server` `get_gdb_server_status`
 - 辅助：`get_usage_guidance` `list_scenarios` `get_best_practices` `get_forbidden_operations`
+
+---
+
+## 注意事项
+
+- **弹窗**：连接目标后会自动禁用 J-Link 对话框弹窗，擦除 / 烧录时不会再跳出 GUI 窗口。
+- **Flash 整片擦除**：`erase_flash()` 擦除的是整颗芯片的 Flash（含 bootloader 与 app），擦除前请确认固件可重新烧录。
+- **运行中访问内存 / 寄存器**：目标运行时读取内存或寄存器会自动暂停目标，操作后需调用 `run_cpu()` 恢复。
+- **修改源码后**：需重启 MCP server（或重新加载客户端）才会生效。
 
 ---
 
