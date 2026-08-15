@@ -117,7 +117,7 @@ class GDBServerManager:
             # 如果指定了序列号，添加序列号参数
             serial_number = jlink_manager._device_serial
             if serial_number:
-                cmd.extend(["-select", "USB", "-usb", serial_number])
+                cmd.extend(["-select", "USB", "-usb", str(serial_number)])
 
             logger.info(f"启动 GDB Server: {' '.join(cmd)}")
 

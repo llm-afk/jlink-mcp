@@ -39,6 +39,7 @@ from .tools.memory import (
 )
 from .tools.flash import (
     erase_flash as _erase_flash,
+    erase_sector as _erase_sector,
     program_flash as _program_flash,
     verify_flash as _verify_flash,
 )
@@ -271,7 +272,7 @@ async def write_register(register_name: str, value: int) -> dict:
 
 
 # ========================================
-# Flash 操作工具 (3个)
+# Flash 操作工具 (4个)
 # ========================================
 
 @mcp.tool()
@@ -294,6 +295,21 @@ async def erase_flash(
 
 
 @mcp.tool()
+async def erase_sector(address: int, count: int = 1, page_size: int = 1024) -> dict:
+    """按扇区（页）擦除 Flash.
+
+    Args:
+        address: 要擦除页内的任意地址（自动对齐到页边界）
+        count: 连续擦除的页数（默认 1）
+        page_size: 页大小（字节，默认 1024，GD32C10x 为 1KB）
+
+    Returns:
+        擦除结果
+    """
+    return _erase_sector(address, count, page_size)
+
+
+@mcp.tool()
 async def program_flash(address: int, data: str | None = None, verify: bool = True, file_path: str | None = None) -> dict:
     """烧录固件到 Flash.
 
@@ -301,11 +317,12 @@ async def program_flash(address: int, data: str | None = None, verify: bool = Tr
         address: 起始地址
         data: 要烧录的数据
         verify: 烧录后是否校验
+        file_path: 固件文件路径（与 data 二选一）
 
     Returns:
         烧录结果
     """
-    return _program_flash(address, data, verify)
+    return _program_flash(address, data, verify, file_path)
 
 
 @mcp.tool()

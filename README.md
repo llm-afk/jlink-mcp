@@ -127,19 +127,19 @@ run_cpu()
 - 连接：`list_jlink_devices` `connect_device` `disconnect_device` `get_connection_status` `match_chip_name`
 - 设备信息：`get_target_info` `get_target_voltage` `scan_target_devices` `list_device_patches`
 - 内存：`read_memory` `write_memory` `read_registers` `write_register`
-- Flash：`erase_flash` `program_flash` `verify_flash`
+- Flash：`erase_flash` `erase_sector` `program_flash` `verify_flash`
 - 调试：`reset_target` `run_cpu` `halt_cpu` `step_instruction` `get_cpu_state` `set_breakpoint` `clear_breakpoint`
 - RTT：`rtt_start` `rtt_read` `rtt_write` `rtt_stop` `rtt_get_status`
-- SVD：`get_svd_peripherals` `get_svd_registers` `parse_register_value` `read_register_with_fields` `list_svd_devices`
+- SVD：`get_svd_peripherals` `get_svd_registers` `parse_register_value` `read_register_with_fields` `read_register_by_address` `write_register_by_address` `list_svd_devices`
 - GDB：`start_gdb_server` `stop_gdb_server` `get_gdb_server_status`
-- 辅助：`get_usage_guidance` `list_scenarios` `get_best_practices` `get_forbidden_operations`
+- 辅助：`get_usage_guidance` `list_scenarios` `get_best_practices` `get_forbidden_operations` `get_system_prompt`
 
 ---
 
 ## 注意事项
 
 - **弹窗**：连接目标后会自动禁用 J-Link 对话框弹窗，擦除 / 烧录时不会再跳出 GUI 窗口。
-- **Flash 整片擦除**：`erase_flash()` 擦除的是整颗芯片的 Flash（含 bootloader 与 app），擦除前请确认固件可重新烧录。
+- **Flash 整片擦除**：`erase_flash()` 擦除的是整颗芯片的 Flash（含 bootloader 与 app），擦除前请确认固件可重新烧录。若只想擦指定扇区（页），用 `erase_sector(address, count)`（仅 GD32/STM32 带 FMC 的芯片）。
 - **运行中访问内存 / 寄存器**：目标运行时读取内存或寄存器会自动暂停目标，操作后需调用 `run_cpu()` 恢复。
 - **修改源码后**：需重启 MCP server（或重新加载客户端）才会生效。
 
@@ -155,7 +155,7 @@ run_cpu()
 先调用 `halt_cpu()` 暂停目标；工具在读取时通常会自动暂停，读完后按需 `run_cpu()`。
 
 **Q：`erase_flash` 会把整颗芯片擦掉吗？**
-会。pylink 的擦除是整片擦除，bootloader 与 app 一并清空，擦除前请确认固件可重新烧录。
+会。pylink 的擦除是整片擦除，bootloader 与 app 一并清空，擦除前请确认固件可重新烧录。若只想擦指定扇区（页），用 `erase_sector(address, count)`（GD32C10x 页大小 1KB，仅对 GD32/STM32 带 FMC 的芯片有效）。
 
 **Q：改了源码 / SVD 后不生效？**
 重启 MCP server（或重新加载 MCP 客户端）才会加载新代码。

@@ -58,11 +58,14 @@ def erase_flash(
             )
 
         logger.info("Flash 擦除成功")
+        message = f"Flash 擦除成功（{erase_type}）"
+        if erase_type == "chip":
+            message += " ⚠️ 已整片擦除整个 Flash（含 bootloader）；如需只擦指定扇区请改用 erase_sector"
         return {
             "success": True,
             "erase_type": erase_type,
             "bytes_erased": bytes_erased,
-            "message": f"Flash 擦除成功（{erase_type}）"
+            "message": message
         }
     except JLinkMCPError as e:
         logger.error(f"擦除 Flash 失败: {e}")
@@ -82,6 +85,103 @@ def erase_flash(
                 "code": JLinkErrorCode.ERASE_FAILED.value[0],
                 "description": str(e),
                 "suggestion": "请检查 Flash 是否被保护，尝试先解除保护"
+            }
+        }
+
+
+def erase_sector(address: int, count: int = 1, page_size: int = 1024) -> Dict[str, Any]:
+    """按扇区（页）擦除 Flash.
+
+    通过 J-Link 原生 Flash 下载算法实现页擦除：向目标扇区写入全 0xFF。
+    J-Link 在下载前会先擦除目标扇区，写入 0xFF（擦除态）等效于擦除，
+    从而只清除指定扇区、不触碰其余 Flash。
+
+    实现说明：GD32C10x 等芯片的 FMC 页擦除命令（PER + START）若经调试器
+    AHB-AP 直接写寄存器触发，FMC 会置 ENDF 但实际不擦除（GigaDevice 特有
+    行为，实测 FMC 编程 PG 经 AHB-AP 正常、页擦除 PER 不生效）。因此这里
+    复用 J-Link 的 RAM 驻留 Flash 算法（即 pylink 的 ``flash()``），用写入
+    全 0xFF 的方式可靠地实现扇区擦除。
+
+    Args:
+        address: 要擦除页内的任意地址（会自动对齐到页边界）
+        count: 连续擦除的页数（默认 1）
+        page_size: 页大小（字节，默认 1024，GD32C10x 为 1KB）
+
+    Returns:
+        包含以下字段的字典:
+        - success: 是否成功
+        - start_address: 对齐后的擦除起始地址
+        - end_address: 擦除结束地址
+        - bytes_erased: 擦除的字节数
+        - pages_erased: 擦除的页数
+        - page_size: 使用的页大小
+        - message: 状态信息
+    """
+    try:
+        if count <= 0:
+            raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, "count 必须 >= 1")
+        if page_size <= 0 or (page_size & (page_size - 1)) != 0:
+            raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, "page_size 必须是 2 的幂")
+
+        jlink = jlink_manager.get_jlink()
+
+        # 对齐到页边界
+        page_mask = ~(page_size - 1)
+        start_address = address & page_mask
+        end_address = start_address + count * page_size
+        total_bytes = count * page_size
+
+        logger.info(f"按扇区擦除 Flash: {start_address:#x} - {end_address:#x} "
+                    f"({count} 页 × {page_size} B)")
+
+        # 复用 J-Link Flash 算法：下载全 0xFF 到目标扇区（内部先擦除再写入）
+        jlink.flash(b"\xff" * total_bytes, start_address)
+
+        # 读回校验：目标区域应全为 0xFF（分块读取，避免单次读取过大）
+        chunk = 0x10000  # 64KB
+        for off in range(0, total_bytes, chunk):
+            n = min(chunk, total_bytes - off)
+            read_back = bytes(jlink.memory_read(start_address + off, n))
+            if not all(b == 0xFF for b in read_back):
+                raise JLinkMCPError(
+                    JLinkErrorCode.ERASE_FAILED,
+                    f"扇区擦除校验失败（地址 {start_address + off:#x} 仍残留数据）"
+                )
+
+        logger.info("扇区擦除成功")
+        return {
+            "success": True,
+            "start_address": start_address,
+            "end_address": end_address,
+            "bytes_erased": total_bytes,
+            "pages_erased": count,
+            "page_size": page_size,
+            "message": f"成功擦除 {count} 页（{human_readable_size(total_bytes)}）"
+        }
+    except JLinkMCPError as e:
+        logger.error(f"扇区擦除失败: {e}")
+        return {
+            "success": False,
+            "start_address": None,
+            "end_address": None,
+            "bytes_erased": 0,
+            "pages_erased": 0,
+            "page_size": page_size,
+            "error": e.to_dict()
+        }
+    except Exception as e:
+        logger.error(f"扇区擦除失败: {e}")
+        return {
+            "success": False,
+            "start_address": None,
+            "end_address": None,
+            "bytes_erased": 0,
+            "pages_erased": 0,
+            "page_size": page_size,
+            "error": {
+                "code": JLinkErrorCode.ERASE_FAILED.value[0],
+                "description": str(e),
+                "suggestion": "请确认目标芯片带 FMC 控制器且 Flash 未写保护"
             }
         }
 

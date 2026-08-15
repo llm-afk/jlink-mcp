@@ -207,7 +207,7 @@ class JLinkManager:
             self._target_connected = self._jlink.target_connected()
 
             self._connected = True
-            self._device_serial = self._jlink.serial_number
+            self._device_serial = str(self._jlink.serial_number)
 
             logger.info(f"成功连接到设备: {self._device_serial}")
 

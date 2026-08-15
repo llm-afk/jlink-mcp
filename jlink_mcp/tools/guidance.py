@@ -43,6 +43,7 @@ TOOL_CATEGORIES = {
         "description": "Flash 擦除、烧录和校验",
         "tools": [
             "erase_flash",
+            "erase_sector",
             "program_flash",
             "verify_flash"
         ]
@@ -76,7 +77,9 @@ TOOL_CATEGORIES = {
             "get_svd_peripherals",
             "get_svd_registers",
             "read_register_with_fields",
-            "parse_register_value"
+            "parse_register_value",
+            "read_register_by_address",
+            "write_register_by_address"
         ]
     },
     "GDB Server": {
@@ -85,6 +88,16 @@ TOOL_CATEGORIES = {
             "start_gdb_server",
             "stop_gdb_server",
             "get_gdb_server_status"
+        ]
+    },
+    "辅助信息": {
+        "description": "使用指南、最佳实践与系统提示词",
+        "tools": [
+            "get_usage_guidance",
+            "get_best_practices",
+            "list_scenarios",
+            "get_forbidden_operations",
+            "get_system_prompt"
         ]
     }
 }
