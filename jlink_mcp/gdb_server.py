@@ -9,7 +9,7 @@ import pylink
 from .jlink_manager import jlink_manager
 from .exceptions import GDBServerError, JLinkErrorCode
 from .models.device import TargetInterface, GDBServerStatus
-from .utils import logger
+from .utils import logger, find_jlink_dll
 
 
 class GDBServerManager:
@@ -61,7 +61,8 @@ class GDBServerManager:
         port: int = 2331,
         device: Optional[str] = None,
         interface: TargetInterface = TargetInterface.SWD,
-        speed: int = 4000
+        speed: int = 4000,
+        jlink_path: Optional[str] = None
     ) -> None:
         """启动 GDB Server.
 
@@ -71,6 +72,9 @@ class GDBServerManager:
             device: 设备名称（None 则使用当前连接的设备）
             interface: 接口类型（默认 SWD）
             speed: 接口速度（kHz，默认 4000）
+            jlink_path: 指定 JLink 安装目录或 GDB Server 可执行文件路径
+                （可选，如 D:\\Program Files\\SEGGER\\JLink_V942）；None 则自动
+                选择最新版本
 
         Raises:
             GDBServerError: 如果启动失败
@@ -98,7 +102,7 @@ class GDBServerManager:
             self._interface = interface
 
             # 构建 GDB Server 命令
-            jlink_exe = self._find_jlink_gdbserver_exe()
+            jlink_exe = self._find_jlink_gdbserver_exe(jlink_path)
             if not jlink_exe:
                 raise GDBServerError(
                     JLinkErrorCode.GDB_SERVER_START_FAILED,
@@ -197,13 +201,23 @@ class GDBServerManager:
             interface=self._interface if self._running else None
         )
 
-    def _find_jlink_gdbserver_exe(self) -> Optional[str]:
-        """查找 JLinkGDBServer.exe 可执行文件.
+    def _find_jlink_gdbserver_exe(self, jlink_path: Optional[str] = None) -> Optional[str]:
+        """查找 JLinkGDBServer 可执行文件（优先最新版本，同版本优先命令行版 CL）.
 
-        查找顺序：
-        1. JLINK_LIB_PATH 环境变量（从 DLL 目录推导 exe，支持非默认安装路径）
-        2. 系统 PATH
-        3. 常见安装路径（含不同盘符与版本号后缀目录，如 JLink_V942）
+        与 utils.find_jlink_dll 保持一致：跨盘符收集候选，按修改时间降序
+        （最新版本优先），保证 GDB Server 与 pylink 实际加载的 JLinkARM.dll
+        版本一致，避免旧版（如 v6.64）不支持新芯片（如 GD32C103）。
+
+        若显式指定 jlink_path（目录或 exe 文件），则直接使用该版本；
+        否则优先复用 find_jlink_dll() 定位到的最新 DLL 所在目录，直接取其中的
+        CL/GUI 版；若失败则回退到多来源扫描并按 mtime 排序。
+
+        MCP 以 stdio 无窗口方式运行，GUI 版 JLinkGDBServer.exe 不向 stdout/stderr
+        输出任何日志；命令行版 JLinkGDBServerCL.exe 输出完整日志、可无窗口运行，
+        故同版本下优先选择 CL 版。
+
+        Args:
+            jlink_path: 指定 JLink 安装目录或 GDB Server 可执行文件路径（可选）
 
         Returns:
             可执行文件路径，如果未找到则返回 None
@@ -211,53 +225,112 @@ class GDBServerManager:
         import os
         import subprocess
 
-        candidates = []
+        def _pick_from(base_dir: str) -> Optional[str]:
+            """在指定目录优先取 CL 版，其次 GUI 版."""
+            cl = os.path.join(base_dir, "JLinkGDBServerCL.exe")
+            if os.path.isfile(cl):
+                return cl
+            gui = os.path.join(base_dir, "JLinkGDBServer.exe")
+            if os.path.isfile(gui):
+                return gui
+            return None
 
-        # 1. 从 JLINK_LIB_PATH 环境变量推导（与 jlink_manager 一致的 DLL 定位方式）
-        lib_path_env = os.environ.get("JLINK_LIB_PATH")
-        if lib_path_env:
-            base_dir = os.path.dirname(lib_path_env) if os.path.isfile(lib_path_env) else lib_path_env
-            candidates.append(os.path.join(base_dir, "JLinkGDBServer.exe"))
-            candidates.append(os.path.join(base_dir, "JLinkGDBServerCL.exe"))
+        def _version_mtime(exe_path: str) -> float:
+            """返回 exe 所属 JLink 版本的修改时间.
 
-        # 2. 从系统 PATH 查找
+            版本由同目录下的 JLink_x64.dll / JLinkARM.dll 的 mtime 判定，
+            而不是 exe 自身的 mtime —— CL 与 GUI 两个 exe 的 mtime 可能相差
+            几秒，若直接按 exe mtime 排序会导致"GUI 比 CL 新 8 秒而排前"，
+            从而误选 GUI 版。同版本下 CL/GUI 的 DLL mtime 完全一致，可稳定
+            区分版本。
+            """
+            d = os.path.dirname(exe_path)
+            for dll_name in ("JLink_x64.dll", "JLinkARM.dll"):
+                dll = os.path.join(d, dll_name)
+                if os.path.isfile(dll):
+                    return os.path.getmtime(dll)
+            return os.path.getmtime(exe_path)
+
+        # 0. 显式指定 jlink_path（目录或 exe 文件）时优先使用
+        if jlink_path:
+            if os.path.isfile(jlink_path):
+                return jlink_path
+            if os.path.isdir(jlink_path):
+                exe = _pick_from(jlink_path)
+                if exe:
+                    return exe
+
+        # 1. 复用 find_jlink_dll 的"按 mtime 选最新"逻辑，保证 DLL 与 GDB Server 版本一致
         try:
-            result = subprocess.run(
-                ["where", "JLinkGDBServer.exe"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            if result.returncode == 0:
-                path = result.stdout.strip().split('\n')[0].strip()
-                if path:
-                    candidates.append(path)
+            dll_path = find_jlink_dll()
+            if dll_path:
+                exe = _pick_from(os.path.dirname(dll_path))
+                if exe:
+                    return exe
         except Exception:
             pass
 
-        # 3. 常见安装路径（覆盖 C/D 盘及带版本号后缀的 JLink_Vxxx 目录）
+        # 2. 回退：多来源扫描，收集所有候选后按 mtime 降序（最新优先），同版本 CL 优先
+        candidates = []
+
+        # 2.1 从 JLINK_LIB_PATH 环境变量推导
+        lib_path_env = os.environ.get("JLINK_LIB_PATH")
+        if lib_path_env:
+            base_dir = os.path.dirname(lib_path_env) if os.path.isfile(lib_path_env) else lib_path_env
+            candidates.append(os.path.join(base_dir, "JLinkGDBServerCL.exe"))
+            candidates.append(os.path.join(base_dir, "JLinkGDBServer.exe"))
+
+        # 2.2 从系统 PATH 查找
+        for name in ("JLinkGDBServerCL.exe", "JLinkGDBServer.exe"):
+            try:
+                result = subprocess.run(
+                    ["where", name],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    path = result.stdout.strip().split('\n')[0].strip()
+                    if path:
+                        candidates.append(path)
+            except Exception:
+                pass
+
+        # 2.3 常见安装路径（覆盖 C/D/E 盘及带版本号后缀的 JLink_Vxxx 目录）
         base_dirs = [
             r"C:\Program Files\SEGGER",
             r"C:\Program Files (x86)\SEGGER",
             r"D:\Program Files\SEGGER",
             r"D:\Program Files (x86)\SEGGER",
+            r"E:\Program Files\SEGGER",
+            r"E:\Program Files (x86)\SEGGER",
         ]
         for base in base_dirs:
             if not os.path.isdir(base):
                 continue
-            # 直接子目录（如 JLink、JLink_V942）
             try:
                 for entry in os.listdir(base):
                     if entry.lower().startswith("jlink") and os.path.isdir(os.path.join(base, entry)):
+                        candidates.append(os.path.join(base, entry, "JLinkGDBServerCL.exe"))
                         candidates.append(os.path.join(base, entry, "JLinkGDBServer.exe"))
             except Exception:
                 pass
+            candidates.append(os.path.join(base, "JLinkGDBServerCL.exe"))
             candidates.append(os.path.join(base, "JLinkGDBServer.exe"))
 
-        # 依次检查候选路径
+        # 去重、过滤存在的、按版本 mtime 降序（最新版本优先），同版本 CL 优先
+        existing = []
+        seen = set()
         for exe_path in candidates:
-            if exe_path and os.path.isfile(exe_path):
-                return exe_path
+            if exe_path and exe_path not in seen and os.path.isfile(exe_path):
+                seen.add(exe_path)
+                existing.append(exe_path)
+
+        if existing:
+            existing.sort(
+                key=lambda p: (-_version_mtime(p), 0 if p.lower().endswith("cl.exe") else 1)
+            )
+            return existing[0]
 
         return None
 
@@ -271,7 +344,8 @@ def start_gdb_server(
     port: int = 2331,
     device: Optional[str] = None,
     interface: str = "SWD",
-    speed: int = 4000
+    speed: int = 4000,
+    jlink_path: Optional[str] = None
 ) -> Dict[str, Any]:
     """启动 GDB Server.
 
@@ -281,6 +355,9 @@ def start_gdb_server(
         device: 设备名称（None 则使用当前连接的设备）
         interface: 接口类型（SWD/JTAG，默认 SWD）
         speed: 接口速度（kHz，默认 4000）
+        jlink_path: 指定 JLink 安装目录或 GDB Server 可执行文件路径
+            （可选，如 D:\\Program Files\\SEGGER\\JLink_V942）；None 则自动
+            选择最新版本
 
     Returns:
         启动结果，包含:
@@ -291,7 +368,7 @@ def start_gdb_server(
     """
     try:
         interface_enum = TargetInterface(interface.upper())
-        gdb_server_manager.start(host, port, device, interface_enum, speed)
+        gdb_server_manager.start(host, port, device, interface_enum, speed, jlink_path)
 
         return {
             "success": True,

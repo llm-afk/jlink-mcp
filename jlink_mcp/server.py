@@ -102,7 +102,7 @@ async def list_jlink_devices() -> list[dict]:
 
 
 @mcp.tool()
-async def connect_device(serial_number: str | None = None, interface: str = "SWD", chip_name: str | None = None) -> dict:
+async def connect_device(serial_number: str | None = None, interface: str = "SWD", chip_name: str | None = None, jlink_path: str | None = None) -> dict:
     """连接到 JLink 设备.
 
     连接到指定的 JLink 调试器。如果不指定序列号，则连接第一个可用设备。
@@ -111,11 +111,13 @@ async def connect_device(serial_number: str | None = None, interface: str = "SWD
         serial_number: 设备序列号（可选）
         interface: 目标接口类型（SWD/JTAG，默认 SWD）
         chip_name: 目标芯片名称（如 STM32F407VG，可选）
+        jlink_path: 指定 JLink 安装目录或 JLink_x64.dll 文件路径（可选，
+            如 D:\\Program Files\\SEGGER\\JLink_V942）；None 则自动选择最新版本
 
     Returns:
         连接结果
     """
-    return _connect_device(serial_number, interface, chip_name)
+    return _connect_device(serial_number, interface, chip_name, jlink_path)
 
 
 @mcp.tool()
@@ -508,7 +510,8 @@ async def start_gdb_server(
     port: int = 2331,
     device: str | None = None,
     interface: str = "SWD",
-    speed: int = 4000
+    speed: int = 4000,
+    jlink_path: str | None = None
 ) -> dict:
     """启动 GDB Server.
 
@@ -518,11 +521,13 @@ async def start_gdb_server(
         device: 设备名称
         interface: 接口类型（SWD/JTAG，默认 SWD）
         speed: 接口速度（kHz）
+        jlink_path: 指定 JLink 安装目录或 GDB Server 可执行文件路径（可选，
+            如 D:\\Program Files\\SEGGER\\JLink_V942）；None 则自动选择最新版本
 
     Returns:
         启动结果
     """
-    return _start_gdb_server(host, port, device, interface, speed)
+    return _start_gdb_server(host, port, device, interface, speed, jlink_path)
 
 
 @mcp.tool()

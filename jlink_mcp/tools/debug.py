@@ -9,6 +9,11 @@ from ..models.operations import DebugBreakpoint, CPUState
 from ..utils import logger
 
 
+def _u32(value):
+    """将寄存器值规范化为无符号 32 位（避免 PC/LR/SP 显示为负数）."""
+    return value & 0xFFFFFFFF if isinstance(value, int) else value
+
+
 def reset_target(reset_type: str = "normal") -> Dict[str, Any]:
     """复位目标芯片.
 
@@ -31,7 +36,13 @@ def reset_target(reset_type: str = "normal") -> Dict[str, Any]:
             logger.info("执行复位并暂停")
             jlink.reset(ms=0, halt=True)
         elif reset_type == "core":
+            # 内核复位：仅复位内核，不拉硬件复位引脚（外设状态保留）
             logger.info("执行内核复位")
+            try:
+                import pylink
+                jlink.set_reset_strategy(pylink.JLinkResetStrategyCortexM3.CORE)
+            except Exception as e:
+                logger.warning(f"设置内核复位策略失败（回退普通复位并暂停）: {e}")
             jlink.reset(ms=0, halt=True)
         else:  # normal
             logger.info("执行普通复位")
@@ -85,7 +96,7 @@ def halt_cpu() -> Dict[str, Any]:
             jlink.reset(ms=0, halt=True)
             time.sleep(0.05)
 
-        pc = jlink.register_read("R15 (PC)")
+        pc = _u32(jlink.register_read("R15 (PC)"))
         logger.info(f"CPU 已暂停，PC = {pc:#x}")
 
         return {
@@ -168,7 +179,7 @@ def step_instruction() -> Dict[str, Any]:
         jlink = jlink_manager.get_jlink()
         jlink.step(thumb=True)
 
-        pc = jlink.register_read("R15 (PC)")
+        pc = _u32(jlink.register_read("R15 (PC)"))
         logger.info(f"单步执行，PC = {pc:#x}")
 
         return {
@@ -218,9 +229,9 @@ def get_cpu_state() -> Dict[str, Any]:
         pc = lr = sp = None
         if halted:
             try:
-                pc = jlink.register_read("R15 (PC)")
-                lr = jlink.register_read("R14")  # LR 寄存器名称是 R14，不是 R14 (LR)
-                sp = jlink.register_read("R13 (SP)")
+                pc = _u32(jlink.register_read("R15 (PC)"))
+                lr = _u32(jlink.register_read("R14"))  # LR 寄存器名称是 R14，不是 R14 (LR)
+                sp = _u32(jlink.register_read("R13 (SP)"))
             except Exception as e:
                 logger.warning(f"读取寄存器失败: {e}")
 

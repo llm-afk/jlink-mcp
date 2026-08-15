@@ -25,7 +25,7 @@ def list_jlink_devices() -> List[Dict[str, Any]]:
     return [device.model_dump() for device in devices]
 
 
-def connect_device(serial_number: str | None = None, interface: str | None = None, chip_name: str | None = None) -> Dict[str, Any]:
+def connect_device(serial_number: str | None = None, interface: str | None = None, chip_name: str | None = None, jlink_path: str | None = None) -> Dict[str, Any]:
     """连接到 JLink 设备.
 
     连接到指定的 JLink 调试器。如果不指定序列号，则连接第一个可用设备。
@@ -35,6 +35,8 @@ def connect_device(serial_number: str | None = None, interface: str | None = Non
         serial_number: 设备序列号（可选，None 则连接第一个设备）
         interface: 目标接口类型，支持 "SWD" 或 "JTAG"（可选，默认从配置读取，默认值为 JTAG）
         chip_name: 目标芯片名称（可选，支持缩写自动匹配，如 FC7300F4MDD）
+        jlink_path: 指定 JLink 安装目录或 JLink_x64.dll 文件路径（可选，
+            如 D:\\Program Files\\SEGGER\\JLink_V942）；None 则自动选择最新版本
 
     Returns:
         连接结果，包含:
@@ -50,7 +52,7 @@ def connect_device(serial_number: str | None = None, interface: str | None = Non
             logger.debug(f"使用配置的默认接口: {interface}")
 
         interface_enum = TargetInterface(interface.upper())
-        jlink_manager.connect(serial_number, interface_enum, chip_name)
+        jlink_manager.connect(serial_number, interface_enum, chip_name, jlink_path)
         status = jlink_manager.get_connection_status()
 
         logger.info(f"成功连接到设备: {status.device_serial}")

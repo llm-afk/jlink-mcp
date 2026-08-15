@@ -112,7 +112,8 @@ class JLinkManager:
         self,
         serial_number: Optional[str] = None,
         interface: TargetInterface = TargetInterface.SWD,
-        chip_name: Optional[str] = None
+        chip_name: Optional[str] = None,
+        jlink_path: Optional[str] = None
     ) -> None:
         """连接到 JLink 设备.
 
@@ -120,6 +121,8 @@ class JLinkManager:
             serial_number: 设备序列号，None 则连接第一个可用设备
             interface: 目标接口类型（SWD/JTAG）
             chip_name: 目标芯片名称（如 STM32F407VG），None 则尝试自动检测
+            jlink_path: 指定 JLink 安装目录或 JLink_x64.dll 文件路径（可选，
+                如 D:\\Program Files\\SEGGER\\JLink_V942）；None 则自动选择最新版本
 
         Raises:
             AlreadyConnectedError: 如果已连接
@@ -133,9 +136,19 @@ class JLinkManager:
             )
 
         try:
-            # 自动定位 JLink DLL：优先 JLINK_LIB_PATH，其次扫描常见安装路径
+            # 定位 JLink DLL：显式指定 jlink_path 优先，否则自动扫描最新版本
+            import os
             lib = None
-            dll_path = find_jlink_dll()
+            if jlink_path:
+                if os.path.isdir(jlink_path):
+                    candidate = os.path.join(jlink_path, "JLink_x64.dll")
+                    dll_path = candidate if os.path.isfile(candidate) else None
+                elif os.path.isfile(jlink_path):
+                    dll_path = jlink_path
+                else:
+                    dll_path = None
+            else:
+                dll_path = find_jlink_dll()
             if dll_path:
                 try:
                     lib = pylink.Library(dllpath=dll_path)
