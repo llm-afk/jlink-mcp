@@ -1,6 +1,5 @@
 """JLink 设备管理器 - 单例模式管理 JLink 连接."""
 
-import os
 import pylink
 from typing import Optional, List
 from contextlib import contextmanager
@@ -18,7 +17,7 @@ from .models.device import (
     TargetDeviceInfo,
     TargetInterface
 )
-from .utils import logger
+from .utils import logger, find_jlink_dll
 from .device_patch_manager import device_patch_manager
 
 
@@ -82,7 +81,10 @@ class JLinkManager:
         devices = []
         try:
             # 获取 USB 设备列表
-            usb_devices = pylink.JLink().connected_emulators()
+            dll_path = find_jlink_dll()
+            lib = pylink.Library(dllpath=dll_path) if dll_path else None
+            probe = pylink.JLink(lib=lib) if lib else pylink.JLink()
+            usb_devices = probe.connected_emulators()
             for dev in usb_devices:
                 # 安全地获取设备属性
                 serial_number = getattr(dev, 'SerialNumber', 'Unknown')
@@ -131,19 +133,16 @@ class JLinkManager:
             )
 
         try:
-            # 支持通过环境变量 JLINK_LIB_PATH 指定 JLink_x64.dll 路径
+            # 自动定位 JLink DLL：优先 JLINK_LIB_PATH，其次扫描常见安装路径
             lib = None
-            lib_path_env = os.environ.get("JLINK_LIB_PATH")
-            if lib_path_env:
-                if os.path.isdir(lib_path_env):
-                    candidate = os.path.join(lib_path_env, "JLink_x64.dll")
-                    if os.path.exists(candidate):
-                        lib_path_env = candidate
-                if os.path.isfile(lib_path_env):
-                    lib = pylink.Library(dllpath=lib_path_env)
-                    logger.info(f"使用自定义 JLink DLL: {lib_path_env}")
-                else:
-                    logger.warning(f"JLINK_LIB_PATH 无效，忽略: {lib_path_env}")
+            dll_path = find_jlink_dll()
+            if dll_path:
+                try:
+                    lib = pylink.Library(dllpath=dll_path)
+                    logger.info(f"使用 JLink DLL: {dll_path}")
+                except Exception as e:
+                    logger.warning(f"加载 JLink DLL 失败（回退默认查找）: {dll_path} - {e}")
+                    lib = None
             self._jlink = pylink.JLink(lib=lib) if lib else pylink.JLink()
 
             # 打开设备
