@@ -43,7 +43,7 @@ class JLinkManager:
         self._jlink: Optional[pylink.JLink] = None
         self._connected: bool = False
         self._device_serial: Optional[str] = None
-        self._target_interface: TargetInterface = TargetInterface.JTAG
+        self._target_interface: TargetInterface = TargetInterface.SWD
         self._target_connected: bool = False
         self._device_name: Optional[str] = None
 
@@ -111,7 +111,7 @@ class JLinkManager:
     def connect(
         self,
         serial_number: Optional[str] = None,
-        interface: TargetInterface = TargetInterface.JTAG,
+        interface: TargetInterface = TargetInterface.SWD,
         chip_name: Optional[str] = None
     ) -> None:
         """连接到 JLink 设备.

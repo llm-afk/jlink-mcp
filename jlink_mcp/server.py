@@ -101,14 +101,14 @@ async def list_jlink_devices() -> list[dict]:
 
 
 @mcp.tool()
-async def connect_device(serial_number: str | None = None, interface: str = "JTAG", chip_name: str | None = None) -> dict:
+async def connect_device(serial_number: str | None = None, interface: str = "SWD", chip_name: str | None = None) -> dict:
     """连接到 JLink 设备.
 
     连接到指定的 JLink 调试器。如果不指定序列号，则连接第一个可用设备。
 
     Args:
         serial_number: 设备序列号（可选）
-        interface: 目标接口类型（SWD/JTAG，默认 JTAG）
+        interface: 目标接口类型（SWD/JTAG，默认 SWD）
         chip_name: 目标芯片名称（如 STM32F407VG，可选）
 
     Returns:
@@ -490,7 +490,7 @@ async def start_gdb_server(
     host: str = "0.0.0.0",
     port: int = 2331,
     device: str | None = None,
-    interface: str = "JTAG",
+    interface: str = "SWD",
     speed: int = 4000
 ) -> dict:
     """启动 GDB Server.
@@ -499,7 +499,7 @@ async def start_gdb_server(
         host: 监听地址
         port: 监听端口
         device: 设备名称
-        interface: 接口类型（SWD/JTAG，默认 JTAG）
+        interface: 接口类型（SWD/JTAG，默认 SWD）
         speed: 接口速度（kHz）
 
     Returns:

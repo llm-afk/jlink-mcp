@@ -96,22 +96,22 @@ USAGE_SCENARIOS = {
         "description": "首次连接 JLink 设备并获取基本信息",
         "steps": [
             "1. list_jlink_devices() - 列出可用设备",
-            "2. connect_device(chip_name='FC7300F4MDD', interface='JTAG') - 连接设备（支持缩写）",
+            "2. connect_device(chip_name='GD32C103VB', interface='SWD') - 连接设备",
             "3. get_connection_status() - 确认连接状态",
             "4. get_target_info() - 获取芯片信息",
             "5. get_target_voltage() - 检查供电电压"
         ],
-        "example": "connect_device(chip_name='FC7300F4MDD')  # 自动匹配到 FC7300F4MDDxXxxxT1C",
+        "example": "connect_device(chip_name='GD32C103VB', interface='SWD')",
         "expected_time": "10-30 秒"
     },
     "读取寄存器": {
         "description": "读取指定寄存器的值并解析字段",
         "steps": [
-            "1. connect_device(chip_name='FC7300F4MDD', interface='JTAG') - 连接设备（支持缩写）",
+            "1. connect_device(chip_name='GD32C103VB', interface='SWD') - 连接设备",
             "2. halt_cpu() - 暂停 CPU（必需！否则读取会失败）",
             "3. read_register_with_fields(device_name, peripheral_name, register_name) - 读取寄存器"
         ],
-        "example": "read_register_with_fields('FC7300F4MDD', 'FLEXCAN0', 'ESR1')",
+        "example": "read_register_with_fields('GD32C10x', 'GPIOA', 'CTL0')",
         "note": "读取寄存器前必须暂停 CPU（halt_cpu），这是成功读取的关键",
         "forbidden": [
             "不要调用 get_svd_peripherals() 遍历外设",
@@ -135,7 +135,7 @@ USAGE_SCENARIOS = {
     "Flash 烧录": {
         "description": "擦除 Flash 并烧录固件",
         "steps": [
-            "1. connect_device(chip_name, interface='JTAG') - 连接设备",
+            "1. connect_device(chip_name, interface='SWD') - 连接设备",
             "2. get_connection_status() - 确认连接",
             "3. erase_flash(start_address, end_address) - 擦除指定区域",
             "4. program_flash(address, data, verify=True) - 烧录并校验",
@@ -193,7 +193,7 @@ BEST_PRACTICES = {
     "read_registers": {
         "title": "读取寄存器最佳实践",
         "recommended_flow": [
-            "1. connect_device(chip_name='FC7300F4MDD', interface='JTAG') - 连接设备（支持缩写）",
+            "1. connect_device(chip_name='GD32C103VB', interface='SWD') - 连接设备",
             "2. halt_cpu() - 暂停 CPU（必需！）",
             "3. read_register_with_fields(device_name, peripheral_name, register_name) - 直接读取寄存器"
         ],
@@ -207,13 +207,13 @@ BEST_PRACTICES = {
             "使用并行调用提高效率（如同时读取多个寄存器）",
             "缓存外设和寄存器信息，避免重复查询",
             "最小化数据传输，只读取必要的字段",
-            "使用芯片名称缩写（如 FC7300F4MDD），系统自动匹配"
+            "使用芯片名称（如 GD32C103VB、STM32F407VG）"
         ],
         "common_mistakes": [
             "❌ 跳过 halt_cpu() 步骤（读取会失败）",
             "✅ 始终在读取前暂停 CPU（halt_cpu）",
-            "❌ 使用完整芯片名称（如 FC7300F4MDDxXxxxT1C）",
-            "✅ 使用缩写名称（如 FC7300F4MDD）",
+            "❌ 混淆 SVD 设备名与芯片名（SVD 用 'GD32C10x'，芯片名用 'GD32C103VB'）",
+            "✅ 用 list_svd_devices() 查看可用 SVD 设备名",
             "❌ 调用 get_svd_peripherals() → get_svd_registers() → read_register_with_fields()（太慢）",
             "✅ 直接调用 read_register_with_fields()（快速）",
             "❌ 连接失败后重复尝试相同的连接方式",
@@ -224,19 +224,19 @@ BEST_PRACTICES = {
         "title": "连接设备最佳实践",
         "recommended_flow": [
             "1. list_jlink_devices() - 列出可用设备",
-            "2. connect_device(chip_name='FC7300F4MDD', interface='JTAG') - 连接设备（支持缩写）",
+            "2. connect_device(chip_name='GD32C103VB', interface='SWD') - 连接设备",
             "3. get_connection_status() - 确认连接状态",
             "4. 连接失败时使用 match_chip_name() 验证名称"
         ],
         "recommended_practices": [
-            "使用芯片名称缩写（如 FC7300F4MDD），系统会自动匹配完整名称",
-            "接口默认使用 JTAG（全局默认），除非明确需要 SWD",
+            "使用芯片名称（如 GD32C103VB、STM32F407VG）",
+            "接口默认使用 SWD（全局默认，接线少、速度快），除非目标仅支持 JTAG",
             "连接失败时使用 match_chip_name() 验证名称",
             "优先使用芯片名称而非序列号（更灵活）"
         ],
         "interface_selection": [
-            "JTAG：全局默认推荐（通用接口）",
-            "SWD：仅用于特定需求（如节省引脚、特定硬件限制）"
+            "SWD：默认推荐（Cortex-M 系列通用，2 线接线少、速度快）",
+            "JTAG：仅当目标只支持 JTAG 或明确需要时使用"
         ],
         "forbidden": [
             "禁止重复尝试相同的连接参数",
@@ -245,8 +245,8 @@ BEST_PRACTICES = {
         ],
         "troubleshooting": {
             "Unsupported device": "使用 list_device_patches() 查看支持的设备，或使用 match_chip_name() 验证名称",
-            "No target connected": "检查目标芯片供电（3.3V），确保 JTAG 连接正确",
-            "Unknown DEV_ID": "尝试不同的接口类型（JTAG/SWD），或检查硬件连接"
+            "No target connected": "检查目标芯片供电（3.3V），确保 SWD 连接正确",
+            "Unknown DEV_ID": "尝试不同的接口类型（SWD/JTAG），或检查硬件连接"
         }
     },
     "memory_operations": {
@@ -540,24 +540,24 @@ def get_forbidden_operations() -> Dict[str, Any]:
         - reasons: 禁止原因说明
     """
     forbidden_ops = {
-        "file_operations": [
-            "不要使用 read_file 工具读取 src/jlink_mcp/ 下的任何源代码文件",
-            "不要读取任何 .py、.md、.txt 等项目文件"
-        ],
-        "debugging": [
-            "不要在正常业务流程中插入源码分析或调试",
-            "不要读取工具函数的源代码来理解其行为",
-            "不要读取配置文件或日志文件"
-        ],
         "tool_usage": [
-            "不要重复调用已失败的连接（尝试不同方法）",
+            "不要重复调用已失败的连接（先分析错误，再换用不同方法）",
             "不要调用 get_svd_peripherals() 遍历所有外设来查找地址",
-            "不要在已知地址的情况下调用 get_svd_registers() 获取寄存器列表"
+            "不要在已知地址的情况下重复调用 get_svd_registers() 获取寄存器列表"
+        ],
+        "flash": [
+            "不要在未擦除的情况下向已写入区域重复烧录（Flash 只能 1→0）",
+            "不要烧录到非 Flash 地址（如 RAM / 外设区）",
+            "不要在烧录失败后直接运行 CPU（先确认烧录完整性）"
+        ],
+        "cpu": [
+            "不要在目标运行时读写内存 / 寄存器（先 halt_cpu）",
+            "不要在 CPU 运行时设置断点（先 halt_cpu）"
         ],
         "performance": [
             "不要在循环中重复调用相同的工具",
             "不要一次性读取大量数据（超过 64KB）",
-            "不要在目标运行时读写内存"
+            "不要盲目调用 get_svd_peripherals() 全量遍历外设"
         ]
     }
 
@@ -565,9 +565,9 @@ def get_forbidden_operations() -> Dict[str, Any]:
         "success": True,
         "forbidden": forbidden_ops,
         "reasons": {
-            "file_operations": "源代码文件不包含运行时信息，读取会浪费时间和带宽",
-            "debugging": "工具的行为通过 docstring 和返回值即可理解，无需源码分析",
-            "tool_usage": "优化工具调用顺序可以提高性能和用户体验",
-            "performance": "避免不必要的操作可以显著提升响应速度"
+            "tool_usage": "优化工具调用顺序可提高性能和用户体验",
+            "flash": "Flash 只能按扇区整片擦写，操作顺序错误会损坏数据",
+            "cpu": "目标运行时读写的值不稳定，必须先暂停",
+            "performance": "避免不必要操作可显著提升响应速度"
         }
     }

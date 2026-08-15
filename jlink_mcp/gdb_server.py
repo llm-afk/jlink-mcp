@@ -36,7 +36,7 @@ class GDBServerManager:
         self._host: str = "0.0.0.0"
         self._port: int = 2331
         self._device: Optional[str] = None
-        self._interface: TargetInterface = TargetInterface.JTAG
+        self._interface: TargetInterface = TargetInterface.SWD
 
         GDBServerManager._initialized = True
         logger.debug("GDBServerManager 初始化完成")
@@ -60,7 +60,7 @@ class GDBServerManager:
         host: str = "0.0.0.0",
         port: int = 2331,
         device: Optional[str] = None,
-        interface: TargetInterface = TargetInterface.JTAG,
+        interface: TargetInterface = TargetInterface.SWD,
         speed: int = 4000
     ) -> None:
         """启动 GDB Server.
@@ -69,7 +69,7 @@ class GDBServerManager:
             host: 监听地址（默认 0.0.0.0）
             port: 监听端口（默认 2331）
             device: 设备名称（None 则使用当前连接的设备）
-            interface: 接口类型（默认 JTAG）
+            interface: 接口类型（默认 SWD）
             speed: 接口速度（kHz，默认 4000）
 
         Raises:
@@ -270,7 +270,7 @@ def start_gdb_server(
     host: str = "0.0.0.0",
     port: int = 2331,
     device: Optional[str] = None,
-    interface: str = "JTAG",
+    interface: str = "SWD",
     speed: int = 4000
 ) -> Dict[str, Any]:
     """启动 GDB Server.

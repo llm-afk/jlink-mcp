@@ -11,7 +11,7 @@ from .utils import logger
 
 class ServerConfig(BaseModel):
     """服务器配置."""
-    default_interface: str = Field(default="JTAG", description="默认接口类型")
+    default_interface: str = Field(default="SWD", description="默认接口类型")
     default_timeout_ms: int = Field(default=10000, description="默认超时时间（毫秒）")
     enable_auto_detect: bool = Field(default=True, description="是否启用自动检测")
     max_memory_read_size: int = Field(default=65536, description="最大内存读取大小（字节）")
