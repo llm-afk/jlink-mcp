@@ -84,17 +84,28 @@ def halt_cpu() -> Dict[str, Any]:
     """
     try:
         jlink = jlink_manager.get_jlink()
+
+        # halt() 是同步的（pylink 的 async_decorator 仅在传入 callback 时才异步），
+        # 成功时内部会 sleep 1s 等待目标真正停止
         jlink.halt()
 
-        # halt() 可能是异步的，轮询等待目标真正停止
-        for _ in range(100):
+        # 以 halted() 为准轮询确认目标已停止（halt() 返回值在某些 DLL/固件下不可靠）
+        halted = False
+        for _ in range(200):  # 最长等待约 1s
             if jlink.halted():
+                halted = True
                 break
             time.sleep(0.005)
-        else:
-            # 仍未停止，用 reset + halt 兜底
-            jlink.reset(ms=0, halt=True)
-            time.sleep(0.05)
+
+        if not halted:
+            # 目标未能在预期时间内停止。绝不能在此处 reset 兜底 ——
+            # reset 会破坏正在运行的程序状态，并把 PC 重置到复位向量，
+            # 导致 "暂停" 被误执行为 "复位"。
+            raise JLinkMCPError(
+                JLinkErrorCode.HALT_FAILED,
+                "目标未能在预期时间内停止，可能处于低功耗模式，或固件使能了"
+                "调试期间不停计的看门狗（复位循环）"
+            )
 
         pc = _u32(jlink.register_read("R15 (PC)"))
         logger.info(f"CPU 已暂停，PC = {pc:#x}")

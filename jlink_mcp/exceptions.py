@@ -30,6 +30,7 @@ class JLinkErrorCode(Enum):
     TARGET_RUNNING = (300, "目标正在运行", "请先暂停目标 (halt_cpu) 再进行此操作")
     TARGET_HALTED = (301, "目标已暂停", "目标当前已处于暂停状态")
     RESET_FAILED = (302, "复位失败", "请检查目标芯片连接和供电状态")
+    HALT_FAILED = (303, "暂停失败", "目标未能在预期时间内停止，请检查是否处于低功耗模式或复位循环")
 
     # RTT 错误 (400-499)
     RTT_NOT_STARTED = (400, "RTT 未启动", "请先调用 rtt_start 启动 RTT")
