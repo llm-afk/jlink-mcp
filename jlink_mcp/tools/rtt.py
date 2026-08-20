@@ -164,6 +164,10 @@ def rtt_read(
         data = jlink.rtt_read(buffer_index, size)
 
         if data:
+            # pylink 的 rtt_read 返回的是 list（整数列表），统一转成 bytes 再解码
+            if isinstance(data, list):
+                data = bytes(data)
+
             # 尝试解码为字符串
             try:
                 text_data = data.decode('utf-8', errors='ignore')
