@@ -164,22 +164,22 @@ def rtt_read(
         data = jlink.rtt_read(buffer_index, size)
 
         if data:
-            # pylink 的 rtt_read 返回的是 list（整数列表），统一转成 bytes 再解码
-            if isinstance(data, list):
-                data = bytes(data)
+            # pylink-square 2.x may return list[int] rather than bytes.
+            # Normalize first so both API variants share the same decode path.
+            data_bytes = bytes(data)
 
             # 尝试解码为字符串
             try:
-                text_data = data.decode('utf-8', errors='ignore')
-            except Exception:
-                text_data = data.decode('latin1')
+                text_data = data_bytes.decode('utf-8', errors='ignore')
+            except UnicodeError:
+                text_data = data_bytes.decode('latin1')
 
-            logger.info(f"RTT 读取 {len(data)} 字节")
+            logger.info(f"RTT 读取 {len(data_bytes)} 字节")
             return {
                 "success": True,
                 "data": text_data,
-                "bytes_read": len(data),
-                "message": f"成功读取 {len(data)} 字节"
+                "bytes_read": len(data_bytes),
+                "message": f"成功读取 {len(data_bytes)} 字节"
             }
         else:
             return {

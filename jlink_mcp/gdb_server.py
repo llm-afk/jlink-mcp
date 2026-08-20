@@ -3,7 +3,6 @@
 import subprocess
 import threading
 import time
-import subprocess
 from typing import Optional, Dict, Any
 
 import pylink
