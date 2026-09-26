@@ -5,8 +5,6 @@ import threading
 import time
 from typing import Optional, Dict, Any
 
-import pylink
-
 from .jlink_manager import jlink_manager
 from .exceptions import GDBServerError, JLinkErrorCode
 from .models.device import TargetInterface, GDBServerStatus
@@ -34,173 +32,170 @@ class GDBServerManager:
 
         self._process: Optional[subprocess.Popen] = None
         self._running: bool = False
-        self._host: str = "0.0.0.0"
+        self._host: str = "127.0.0.1"
         self._port: int = 2331
         self._device: Optional[str] = None
         self._interface: TargetInterface = TargetInterface.SWD
+        self._lock = threading.RLock()
+        self._ready = threading.Event()
+        self._reader: Optional[threading.Thread] = None
+        self._output_tail = ""
+        self._owns_reservation = False
 
         GDBServerManager._initialized = True
         logger.debug("GDBServerManager 初始化完成")
 
     @property
     def is_running(self) -> bool:
-        """检查 GDB Server 是否正在运行."""
-        if self._process is None:
-            return False
-
-        # 检查进程是否仍然存活
-        if self._process.poll() is not None:
-            logger.warning("GDB Server 进程已意外终止")
-            self._cleanup()
-            return False
-
-        return self._running
+        """进程退出后及时释放设备保留。"""
+        with self._lock:
+            if self._process is not None and self._process.poll() is not None:
+                self._cleanup()
+            return self._process is not None and self._running
 
     def start(
         self,
-        host: str = "0.0.0.0",
+        host: str = "127.0.0.1",
         port: int = 2331,
         device: Optional[str] = None,
-        interface: TargetInterface = TargetInterface.SWD,
+        interface: Optional[TargetInterface] = None,
         speed: int = 4000,
-        jlink_path: Optional[str] = None
+        jlink_path: Optional[str] = None,
+        transfer_connection: bool = False,
     ) -> None:
-        """启动 GDB Server.
+        """启动 GDB；已有 MCP 连接时需显式交接，停止后不自动重连目标。
 
-        Args:
-            host: 监听地址（默认 0.0.0.0）
-            port: 监听端口（默认 2331）
-            device: 设备名称（None 则使用当前连接的设备）
-            interface: 接口类型（默认 SWD）
-            speed: 接口速度（kHz，默认 4000）
-            jlink_path: 指定 JLink 安装目录或 GDB Server 可执行文件路径
-                （可选，如 D:\\Program Files\\SEGGER\\JLink_V942）；None 则自动
-                选择最新版本
-
-        Raises:
-            GDBServerError: 如果启动失败
+        host 仅支持 127.0.0.1（本机）或 0.0.0.0（远程）。
+        device/interface 未指定时继承当前 MCP 连接。
+        未连接 MCP 时必须指定 device，interface 默认 SWD，探针由 GDB 选择。
+        transfer_connection=True 表示允许停止 RTT 并关闭当前 MCP 连接。
         """
-        if self.is_running:
-            raise GDBServerError(
-                JLinkErrorCode.GDB_SERVER_ALREADY_RUNNING,
-                f"GDB Server 已在运行（端口 {self._port}）",
-                "如需重启，请先调用 stop_gdb_server"
-            )
-
-        if not jlink_manager.is_connected:
-            raise GDBServerError(
-                JLinkErrorCode.NOT_INITIALIZED,
-                "JLink 未连接",
-                "请先调用 connect_device 建立连接"
-            )
-
-        try:
-            import subprocess
-
-            self._host = host
-            self._port = port
-            self._device = device
-            self._interface = interface
-
-            # 构建 GDB Server 命令
+        with self._lock:
+            if self.is_running:
+                raise GDBServerError(JLinkErrorCode.GDB_SERVER_ALREADY_RUNNING,
+                                     f"GDB Server 已在运行（端口 {self._port}）")
+            if host not in ("127.0.0.1", "0.0.0.0"):
+                raise GDBServerError(JLinkErrorCode.INVALID_PARAMETER,
+                                     "host 仅支持 127.0.0.1 或 0.0.0.0")
+            if (isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535
+                    or isinstance(speed, bool) or not isinstance(speed, int) or speed <= 0):
+                raise GDBServerError(JLinkErrorCode.INVALID_PARAMETER, "port 或 speed 无效")
+            if interface is not None and interface not in (TargetInterface.SWD, TargetInterface.JTAG):
+                raise GDBServerError(JLinkErrorCode.INVALID_PARAMETER, "interface 仅支持 SWD/JTAG")
+            connected = jlink_manager.is_connected
+            selected_device = device if device is not None else (jlink_manager._device_name if connected else None)
+            if not selected_device or not selected_device.strip():
+                raise GDBServerError(JLinkErrorCode.INVALID_PARAMETER,
+                                     "未连接 MCP 时必须指定 device；已连接时可继承当前芯片名称")
             jlink_exe = self._find_jlink_gdbserver_exe(jlink_path)
             if not jlink_exe:
-                raise GDBServerError(
-                    JLinkErrorCode.GDB_SERVER_START_FAILED,
-                    "未找到 JLinkGDBServer.exe",
-                    "请确保已安装 SEGGER JLink 软件并添加到系统 PATH"
+                raise GDBServerError(JLinkErrorCode.GDB_SERVER_START_FAILED,
+                                     "未找到 JLinkGDBServer 可执行文件，请检查 jlink_path")
+
+            try:
+                connection = jlink_manager.reserve_for_gdb(transfer_connection)
+                self._owns_reservation = True
+                self._host, self._port = host, port
+                self._device = selected_device.strip()
+                self._interface = interface or connection["interface"]
+                cmd = [
+                    jlink_exe, "-device", self._device,
+                    "-if", self._interface.value.lower(), "-speed", str(speed),
+                    "-port", str(port), "-LocalhostOnly", "1" if host == "127.0.0.1" else "0",
+                    "-strict", "-nogui", "-nosilent", "-timeout", "10000",
+                ]
+                if connection["serial_number"]:
+                    cmd.extend(["-select", "USB=" + str(connection["serial_number"])])
+                self._ready.clear()
+                self._output_tail = ""
+                logger.info(f"启动 GDB Server: {' '.join(cmd)}")
+                self._process = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
+                self._reader = threading.Thread(
+                    target=self._drain_output, args=(self._process.stdout,), daemon=True,
+                    name="jlink-gdb-output",
+                )
+                self._reader.start()
+                self._wait_until_ready(timeout=10.0)
+                self._running = True
+            except Exception as exc:
+                self._cleanup()
+                if isinstance(exc, GDBServerError):
+                    raise
+                raise GDBServerError(JLinkErrorCode.GDB_SERVER_START_FAILED, str(exc), exc) from exc
 
-            cmd = [
-                jlink_exe,
-                "-device", device or "",
-                "-if", interface.value.lower(),
-                "-speed", str(speed),
-                "-port", str(port)
-            ]
+    def _drain_output(self, stream) -> None:
+        """持续排空合并后的输出流，仅保留有限诊断文本。"""
+        import codecs
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        try:
+            while True:
+                chunk = stream.read1(4096)
+                if not chunk:
+                    break
+                self._output_tail = (self._output_tail + decoder.decode(chunk))[-16384:]
+                # SEGGER 的该提示表示可接受 GDB 客户端；仅 Listening on TCP/IP
+                # 可能出现在目标连接完成前，不能当作就绪信号。
+                if "waiting for gdb connection" in self._output_tail.lower():
+                    self._ready.set()
+        except (OSError, ValueError) as exc:
+            logger.debug(f"GDB 输出流已关闭: {exc}")
 
-            # 如果指定了序列号，添加序列号参数
-            serial_number = jlink_manager._device_serial
-            if serial_number:
-                cmd.extend(["-select", "USB", "-usb", str(serial_number)])
-
-            logger.info(f"启动 GDB Server: {' '.join(cmd)}")
-
-            # 启动进程
-            self._process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-
-            # 等待进程启动
-            time.sleep(0.5)
-
+    def _wait_until_ready(self, timeout: float) -> None:
+        """仅在 GDB 报告可接受调试连接时成功，进程存活本身不足以判定。"""
+        deadline = time.monotonic() + timeout
+        while True:
             if self._process.poll() is not None:
-                stdout, stderr = self._process.communicate()
-                error_msg = stderr.decode('utf-8', errors='ignore') or stdout.decode('utf-8', errors='ignore')
-                raise GDBServerError(
-                    JLinkErrorCode.GDB_SERVER_START_FAILED,
-                    f"GDB Server 启动失败: {error_msg}",
-                    "请检查端口是否被占用，或查看 JLink 日志"
-                )
-
-            self._running = True
-            logger.info(f"GDB Server 已启动，监听 {host}:{port}")
-
-        except GDBServerError:
-            self._cleanup()
-            raise
-        except Exception as e:
-            self._cleanup()
-            raise GDBServerError(
-                JLinkErrorCode.GDB_SERVER_START_FAILED,
-                f"启动 GDB Server 时发生异常: {e}",
-                "请检查 JLink 软件是否正确安装"
-            )
+                if self._reader:
+                    self._reader.join(timeout=0.2)
+                raise GDBServerError(JLinkErrorCode.GDB_SERVER_START_FAILED,
+                                     f"GDB Server 启动失败: {self._output_tail[-4000:]}")
+            if self._ready.is_set():
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GDBServerError(JLinkErrorCode.OPERATION_TIMEOUT,
+                                     f"等待 GDB Server 就绪超时: {self._output_tail[-4000:]}")
+            self._ready.wait(min(0.05, remaining))
 
     def stop(self) -> None:
-        """停止 GDB Server."""
-        if not self.is_running:
-            logger.debug("GDB Server 未运行")
-            return
-
-        logger.info("正在停止 GDB Server")
-        self._cleanup()
-        logger.info("GDB Server 已停止")
+        """停止 GDB 并释放探针；随后需用户显式重新连接 MCP。"""
+        with self._lock:
+            self._cleanup()
 
     def _cleanup(self) -> None:
-        """清理资源."""
-        if self._process:
-            try:
-                self._process.terminate()
-                # 等待进程结束
+        process = self._process
+        if process is not None:
+            if process.poll() is None:
                 try:
-                    self._process.wait(timeout=2)
+                    process.terminate()
+                    process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
-                    self._process.kill()
-                    self._process.wait()
-            except Exception as e:
-                logger.warning(f"清理 GDB Server 进程时出错: {e}")
-            finally:
-                self._process = None
-
+                    process.kill()
+                    process.wait(timeout=2)
+            if self._reader:
+                self._reader.join(timeout=1)
+            if process.stdout:
+                process.stdout.close()
+            self._process = None
+            self._reader = None
         self._running = False
+        self._ready.clear()
+        self._device = None
+        if self._owns_reservation:
+            jlink_manager.release_gdb_reservation()
+            self._owns_reservation = False
 
     def get_status(self) -> GDBServerStatus:
-        """获取 GDB Server 状态.
-
-        Returns:
-            GDB Server 状态信息
-        """
-        return GDBServerStatus(
-            running=self.is_running,
-            host=self._host if self._running else None,
-            port=self._port if self._running else None,
-            device_name=self._device,
-            interface=self._interface if self._running else None
-        )
+        with self._lock:
+            running = self.is_running
+            return GDBServerStatus(
+                running=running, host=self._host if running else None,
+                port=self._port if running else None, device_name=self._device if running else None,
+                interface=self._interface if running else None,
+            )
 
     def _find_jlink_gdbserver_exe(self, jlink_path: Optional[str] = None) -> Optional[str]:
         """查找 JLinkGDBServer 可执行文件（优先最新版本，同版本优先命令行版 CL）.
@@ -341,21 +336,23 @@ gdb_server_manager = GDBServerManager()
 
 
 def start_gdb_server(
-    host: str = "0.0.0.0",
+    host: str = "127.0.0.1",
     port: int = 2331,
     device: Optional[str] = None,
-    interface: str = "SWD",
+    interface: Optional[str] = None,
     speed: int = 4000,
-    jlink_path: Optional[str] = None
+    jlink_path: Optional[str] = None,
+    transfer_connection: bool = False,
 ) -> Dict[str, Any]:
     """启动 GDB Server.
 
     Args:
-        host: 监听地址（默认 0.0.0.0）
+        host: 监听范围：127.0.0.1（默认）或 0.0.0.0
         port: 监听端口（默认 2331）
         device: 设备名称（None 则使用当前连接的设备）
-        interface: 接口类型（SWD/JTAG，默认 SWD）
+        interface: 接口类型（SWD/JTAG，None 继承当前连接）
         speed: 接口速度（kHz，默认 4000）
+        transfer_connection: 是否允许将已连接的 MCP 探针交给 GDB（默认 False）
         jlink_path: 指定 JLink 安装目录或 GDB Server 可执行文件路径
             （可选，如 D:\\Program Files\\SEGGER\\JLink_V942）；None 则自动
             选择最新版本
@@ -368,8 +365,8 @@ def start_gdb_server(
         - message: 状态信息
     """
     try:
-        interface_enum = TargetInterface(interface.upper())
-        gdb_server_manager.start(host, port, device, interface_enum, speed, jlink_path)
+        interface_enum = TargetInterface(interface.upper()) if interface is not None else None
+        gdb_server_manager.start(host, port, device, interface_enum, speed, jlink_path, transfer_connection)
 
         return {
             "success": True,

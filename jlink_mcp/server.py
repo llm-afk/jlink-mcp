@@ -11,9 +11,15 @@
 - GDB Server：启动/停止 GDB 调试服务器
 """
 
+from contextlib import asynccontextmanager
+
+import anyio
 from mcp.server.fastmcp import FastMCP
+from pydantic import StrictBool, StrictInt
 
 from .jlink_manager import jlink_manager
+from .executor import SerialToolExecutor
+from .models.parameters import Address
 from .utils import logger
 from .config_manager import config_manager
 
@@ -80,8 +86,34 @@ from .tools.guidance import (
     get_forbidden_operations as _get_forbidden_operations,
 )
 
-# 创建 FastMCP 实例
-mcp = FastMCP("jlink-mcp-server")
+# Native J-Link handles stay on the same worker for their entire lifetime.
+hardware_executor = SerialToolExecutor("jlink-hardware")
+metadata_executor = SerialToolExecutor("jlink-svd")
+
+
+def _cleanup_hardware():
+    from .gdb_server import gdb_server_manager
+
+    try:
+        gdb_server_manager.stop()
+    finally:
+        jlink_manager.disconnect()
+
+
+@asynccontextmanager
+async def server_lifespan(server):
+    try:
+        yield {}
+    finally:
+        # A cancelled request must not interrupt closing the probe or GDB process.
+        with anyio.CancelScope(shield=True):
+            try:
+                await hardware_executor.aclose(_cleanup_hardware)
+            finally:
+                await metadata_executor.aclose()
+
+
+mcp = FastMCP("jlink-mcp-server", lifespan=server_lifespan)
 
 
 # ========================================
@@ -98,7 +130,7 @@ async def list_jlink_devices() -> list[dict]:
     Returns:
         设备信息列表
     """
-    return _list_jlink_devices()
+    return await hardware_executor.run(_list_jlink_devices)
 
 
 @mcp.tool()
@@ -117,7 +149,7 @@ async def connect_device(serial_number: str | None = None, interface: str = "SWD
     Returns:
         连接结果
     """
-    return _connect_device(serial_number, interface, chip_name, jlink_path)
+    return await hardware_executor.run(_connect_device, serial_number, interface, chip_name, jlink_path)
 
 
 @mcp.tool()
@@ -129,7 +161,7 @@ async def disconnect_device() -> dict:
     Returns:
         断开结果
     """
-    return _disconnect_device()
+    return await hardware_executor.run(_disconnect_device)
 
 
 @mcp.tool()
@@ -141,7 +173,7 @@ async def get_connection_status() -> dict:
     Returns:
         连接状态信息
     """
-    return _get_connection_status()
+    return await hardware_executor.run(_get_connection_status)
 
 
 @mcp.tool()
@@ -157,7 +189,7 @@ async def match_chip_name(chip_name: str) -> dict:
     Returns:
         匹配结果，包含 matched（匹配到的完整名称）和 all_matches（所有匹配项）
     """
-    return _match_chip_name(chip_name)
+    return await hardware_executor.run(_match_chip_name, chip_name)
 
 
 # ========================================
@@ -173,7 +205,7 @@ async def get_target_info() -> dict:
     Returns:
         目标设备信息
     """
-    return _get_target_info()
+    return await hardware_executor.run(_get_target_info)
 
 
 @mcp.tool()
@@ -185,7 +217,7 @@ async def get_target_voltage() -> dict:
     Returns:
         电压信息
     """
-    return _get_target_voltage()
+    return await hardware_executor.run(_get_target_voltage)
 
 
 @mcp.tool()
@@ -197,7 +229,7 @@ async def scan_target_devices() -> dict:
     Returns:
         扫描结果
     """
-    return _scan_target_devices()
+    return await hardware_executor.run(_scan_target_devices)
 
 
 @mcp.tool()
@@ -209,7 +241,7 @@ async def list_device_patches() -> dict:
     Returns:
         设备补丁列表
     """
-    return _list_device_patches()
+    return await hardware_executor.run(_list_device_patches)
 
 
 # ========================================
@@ -217,7 +249,7 @@ async def list_device_patches() -> dict:
 # ========================================
 
 @mcp.tool()
-async def read_memory(address: int, size: int, width: int = 32) -> dict:
+async def read_memory(address: Address, size: StrictInt, width: StrictInt = 32) -> dict:
     """读取指定地址的内存.
 
     Args:
@@ -228,11 +260,11 @@ async def read_memory(address: int, size: int, width: int = 32) -> dict:
     Returns:
         内存读取结果
     """
-    return _read_memory(address, size, width)
+    return await hardware_executor.run(_read_memory, address, size, width)
 
 
 @mcp.tool()
-async def write_memory(address: int, data: str, width: int = 32) -> dict:
+async def write_memory(address: Address, data: str, width: StrictInt = 32) -> dict:
     """写入内存.
 
     Args:
@@ -243,7 +275,7 @@ async def write_memory(address: int, data: str, width: int = 32) -> dict:
     Returns:
         写入结果
     """
-    return _write_memory(address, data, width)
+    return await hardware_executor.run(_write_memory, address, data, width)
 
 
 @mcp.tool()
@@ -256,11 +288,11 @@ async def read_registers(register_names: list[str] | None = None) -> dict:
     Returns:
         寄存器值
     """
-    return _read_registers(register_names)
+    return await hardware_executor.run(_read_registers, register_names)
 
 
 @mcp.tool()
-async def write_register(register_name: str, value: int) -> dict:
+async def write_register(register_name: str, value: StrictInt) -> dict:
     """写入单个寄存器.
 
     Args:
@@ -270,7 +302,7 @@ async def write_register(register_name: str, value: int) -> dict:
     Returns:
         写入结果
     """
-    return _write_register(register_name, value)
+    return await hardware_executor.run(_write_register, register_name, value)
 
 
 # ========================================
@@ -279,25 +311,25 @@ async def write_register(register_name: str, value: int) -> dict:
 
 @mcp.tool()
 async def erase_flash(
-    start_address: int | None = None,
-    end_address: int | None = None,
-    chip_erase: bool = False
+    start_address: Address | None = None,
+    end_address: Address | None = None,
+    chip_erase: StrictBool = False
 ) -> dict:
-    """擦除 Flash.
+    """显式执行整片 Flash 擦除；范围擦除请使用 erase_sector.
 
     Args:
-        start_address: 起始地址（可选）
-        end_address: 结束地址（可选）
-        chip_erase: 是否整片擦除
+        start_address: 兼容旧接口，传入将报错，不会擦除
+        end_address: 兼容旧接口，传入将报错，不会擦除
+        chip_erase: 必须为 True；会清空整个 Flash（含 bootloader）
 
     Returns:
         擦除结果
     """
-    return _erase_flash(start_address, end_address, chip_erase)
+    return await hardware_executor.run(_erase_flash, start_address, end_address, chip_erase)
 
 
 @mcp.tool()
-async def erase_sector(address: int, count: int = 1, page_size: int = 1024) -> dict:
+async def erase_sector(address: Address, count: StrictInt = 1, page_size: StrictInt = 1024) -> dict:
     """按扇区（页）擦除 Flash.
 
     Args:
@@ -308,11 +340,11 @@ async def erase_sector(address: int, count: int = 1, page_size: int = 1024) -> d
     Returns:
         擦除结果
     """
-    return _erase_sector(address, count, page_size)
+    return await hardware_executor.run(_erase_sector, address, count, page_size)
 
 
 @mcp.tool()
-async def program_flash(address: int, data: str | None = None, verify: bool = True, file_path: str | None = None) -> dict:
+async def program_flash(address: Address, data: str | None = None, verify: StrictBool = True, file_path: str | None = None) -> dict:
     """烧录固件到 Flash.
 
     Args:
@@ -324,11 +356,11 @@ async def program_flash(address: int, data: str | None = None, verify: bool = Tr
     Returns:
         烧录结果
     """
-    return _program_flash(address, data, verify, file_path)
+    return await hardware_executor.run(_program_flash, address, data, verify, file_path)
 
 
 @mcp.tool()
-async def verify_flash(address: int, data: str) -> dict:
+async def verify_flash(address: Address, data: str) -> dict:
     """校验 Flash 内容.
 
     Args:
@@ -338,7 +370,7 @@ async def verify_flash(address: int, data: str) -> dict:
     Returns:
         校验结果
     """
-    return _verify_flash(address, data)
+    return await hardware_executor.run(_verify_flash, address, data)
 
 
 # ========================================
@@ -355,7 +387,7 @@ async def reset_target(reset_type: str = "normal") -> dict:
     Returns:
         复位结果
     """
-    return _reset_target(reset_type)
+    return await hardware_executor.run(_reset_target, reset_type)
 
 
 @mcp.tool()
@@ -365,7 +397,7 @@ async def halt_cpu() -> dict:
     Returns:
         暂停结果
     """
-    return _halt_cpu()
+    return await hardware_executor.run(_halt_cpu)
 
 
 @mcp.tool()
@@ -375,7 +407,7 @@ async def run_cpu() -> dict:
     Returns:
         运行结果
     """
-    return _run_cpu()
+    return await hardware_executor.run(_run_cpu)
 
 
 @mcp.tool()
@@ -385,7 +417,7 @@ async def step_instruction() -> dict:
     Returns:
         单步执行结果
     """
-    return _step_instruction()
+    return await hardware_executor.run(_step_instruction)
 
 
 @mcp.tool()
@@ -395,11 +427,11 @@ async def get_cpu_state() -> dict:
     Returns:
         CPU 状态信息
     """
-    return _get_cpu_state()
+    return await hardware_executor.run(_get_cpu_state)
 
 
 @mcp.tool()
-async def set_breakpoint(address: int) -> dict:
+async def set_breakpoint(address: Address) -> dict:
     """设置断点.
 
     Args:
@@ -408,11 +440,11 @@ async def set_breakpoint(address: int) -> dict:
     Returns:
         设置结果
     """
-    return _set_breakpoint(address)
+    return await hardware_executor.run(_set_breakpoint, address)
 
 
 @mcp.tool()
-async def clear_breakpoint(address: int) -> dict:
+async def clear_breakpoint(address: Address) -> dict:
     """清除断点.
 
     Args:
@@ -421,7 +453,7 @@ async def clear_breakpoint(address: int) -> dict:
     Returns:
         清除结果
     """
-    return _clear_breakpoint(address)
+    return await hardware_executor.run(_clear_breakpoint, address)
 
 
 # ========================================
@@ -430,9 +462,10 @@ async def clear_breakpoint(address: int) -> dict:
 
 @mcp.tool()
 async def rtt_start(
-    buffer_index: int = 0,
+    buffer_index: StrictInt = 0,
     read_mode: str = "continuous",
-    timeout_ms: int = 1000
+    timeout_ms: StrictInt = 1000,
+    block_address: Address | None = None
 ) -> dict:
     """启动 RTT.
 
@@ -440,11 +473,12 @@ async def rtt_start(
         buffer_index: RTT 缓冲区索引
         read_mode: 读取模式
         timeout_ms: 超时时间（毫秒）
+        block_address: 可选 RTT 控制块地址，None 时由 J-Link 搜索
 
     Returns:
         启动结果
     """
-    return _rtt_start(buffer_index, read_mode, timeout_ms)
+    return await hardware_executor.run(_rtt_start, buffer_index, read_mode, timeout_ms, block_address)
 
 
 @mcp.tool()
@@ -454,40 +488,40 @@ async def rtt_stop() -> dict:
     Returns:
         停止结果
     """
-    return _rtt_stop()
+    return await hardware_executor.run(_rtt_stop)
 
 
 @mcp.tool()
 async def rtt_read(
-    buffer_index: int = 0,
-    size: int = 1024,
-    timeout_ms: int | None = None
+    buffer_index: StrictInt | None = None,
+    size: StrictInt = 1024,
+    timeout_ms: StrictInt | None = None
 ) -> dict:
     """读取 RTT 日志.
 
     Args:
-        buffer_index: RTT 缓冲区索引
+        buffer_index: RTT 缓冲区索引，None 使用启动时的配置
         size: 读取大小（字节）
         timeout_ms: 超时时间（毫秒）
 
     Returns:
         读取结果
     """
-    return _rtt_read(buffer_index, size, timeout_ms)
+    return await hardware_executor.run(_rtt_read, buffer_index, size, timeout_ms)
 
 
 @mcp.tool()
-async def rtt_write(data: str, buffer_index: int = 0) -> dict:
+async def rtt_write(data: str, buffer_index: StrictInt | None = None) -> dict:
     """向 RTT 写入数据.
 
     Args:
         data: 要写入的数据
-        buffer_index: RTT 缓冲区索引
+        buffer_index: RTT 缓冲区索引，None 使用启动时的配置
 
     Returns:
         写入结果
     """
-    return _rtt_write(data, buffer_index)
+    return await hardware_executor.run(_rtt_write, data, buffer_index)
 
 
 @mcp.tool()
@@ -497,7 +531,7 @@ async def rtt_get_status() -> dict:
     Returns:
         RTT 状态信息
     """
-    return _rtt_get_status()
+    return await hardware_executor.run(_rtt_get_status)
 
 
 # ========================================
@@ -506,28 +540,30 @@ async def rtt_get_status() -> dict:
 
 @mcp.tool()
 async def start_gdb_server(
-    host: str = "0.0.0.0",
-    port: int = 2331,
+    host: str = "127.0.0.1",
+    port: StrictInt = 2331,
     device: str | None = None,
-    interface: str = "SWD",
-    speed: int = 4000,
-    jlink_path: str | None = None
+    interface: str | None = None,
+    speed: StrictInt = 4000,
+    jlink_path: str | None = None,
+    transfer_connection: StrictBool = False
 ) -> dict:
     """启动 GDB Server.
 
     Args:
-        host: 监听地址
+        host: 127.0.0.1 仅本机，0.0.0.0 允许远程连接
         port: 监听端口
         device: 设备名称
-        interface: 接口类型（SWD/JTAG，默认 SWD）
+        interface: 接口类型（SWD/JTAG，None 继承当前连接或使用 SWD）
         speed: 接口速度（kHz）
         jlink_path: 指定 JLink 安装目录或 GDB Server 可执行文件路径（可选，
             如 D:\\Program Files\\SEGGER\\JLink_V942）；None 则自动选择最新版本
+        transfer_connection: 显式允许释放 MCP 当前连接，将探针交给 GDB；停止后需重新连接
 
     Returns:
         启动结果
     """
-    return _start_gdb_server(host, port, device, interface, speed, jlink_path)
+    return await hardware_executor.run(_start_gdb_server, host, port, device, interface, speed, jlink_path, transfer_connection)
 
 
 @mcp.tool()
@@ -537,7 +573,7 @@ async def stop_gdb_server() -> dict:
     Returns:
         停止结果
     """
-    return _stop_gdb_server()
+    return await hardware_executor.run(_stop_gdb_server)
 
 
 @mcp.tool()
@@ -547,7 +583,7 @@ async def get_gdb_server_status() -> dict:
     Returns:
         GDB Server 状态信息
     """
-    return _get_gdb_server_status()
+    return await hardware_executor.run(_get_gdb_server_status)
 
 
 # ========================================
@@ -563,7 +599,7 @@ async def list_svd_devices() -> dict:
     Returns:
         设备列表
     """
-    return _list_svd_devices()
+    return await metadata_executor.run(_list_svd_devices)
 
 
 @mcp.tool()
@@ -576,7 +612,7 @@ async def get_svd_peripherals(device_name: str) -> dict:
     Returns:
         外设列表
     """
-    return _get_svd_peripherals(device_name)
+    return await metadata_executor.run(_get_svd_peripherals, device_name)
 
 
 @mcp.tool()
@@ -590,7 +626,7 @@ async def get_svd_registers(device_name: str, peripheral_name: str) -> dict:
     Returns:
         寄存器列表
     """
-    return _get_svd_registers(device_name, peripheral_name)
+    return await metadata_executor.run(_get_svd_registers, device_name, peripheral_name)
 
 
 @mcp.tool()
@@ -609,7 +645,7 @@ async def read_register_with_fields(
     Returns:
         寄存器值和字段解析结果
     """
-    return _read_register_with_fields(device_name, peripheral_name, register_name)
+    return await hardware_executor.run(_read_register_with_fields, device_name, peripheral_name, register_name)
 
 
 @mcp.tool()
@@ -617,7 +653,7 @@ async def parse_register_value(
     device_name: str,
     peripheral_name: str,
     register_name: str,
-    value: int
+    value: StrictInt
 ) -> dict:
     """解析寄存器值（仅解析，不读取硬件）.
 
@@ -630,13 +666,13 @@ async def parse_register_value(
     Returns:
         寄存器值和字段解析结果
     """
-    return _parse_register_value(device_name, peripheral_name, register_name, value)
+    return await metadata_executor.run(_parse_register_value, device_name, peripheral_name, register_name, value)
 
 
 @mcp.tool()
 async def read_register_by_address(
-    address: int,
-    width: int = 32,
+    address: Address,
+    width: StrictInt = 32,
     device_name: str | None = None
 ) -> dict:
     """按地址直接读取寄存器值（不依赖 SVD）.
@@ -653,14 +689,14 @@ async def read_register_by_address(
     Returns:
         寄存器值和可选的字段解析结果
     """
-    return _read_register_by_address(address, width, device_name)
+    return await hardware_executor.run(_read_register_by_address, address, width, device_name)
 
 
 @mcp.tool()
 async def write_register_by_address(
-    address: int,
-    value: int,
-    width: int = 32
+    address: Address,
+    value: StrictInt,
+    width: StrictInt = 32
 ) -> dict:
     """按地址直接写入寄存器值（不依赖 SVD）.
 
@@ -674,7 +710,7 @@ async def write_register_by_address(
     Returns:
         写入结果
     """
-    return _write_register_by_address(address, value, width)
+    return await hardware_executor.run(_write_register_by_address, address, value, width)
 
 
 # ========================================
@@ -682,7 +718,7 @@ async def write_register_by_address(
 # ========================================
 
 @mcp.tool()
-async def get_usage_guidance(category: str | None = None, include_examples: bool = True) -> dict:
+async def get_usage_guidance(category: str | None = None, include_examples: StrictBool = True) -> dict:
     """获取 JLink MCP 工具使用指南.
 
     提供所有可用工具的分类、描述和使用示例。
@@ -812,8 +848,8 @@ def init_server_config():
     config_manager.add_custom_prompt(
         "flash_programming",
         """Flash 烧录指南：
-1. 使用 JTAG 接口连接设备
-2. 先擦除 Flash（erase_flash()）
+1. 使用目标支持的 SWD/JTAG 接口连接设备
+2. 按需擦除；整片擦除显式使用 erase_flash(chip_erase=True)，会清空 bootloader
 3. 烧录时启用校验（verify=True）
 4. Flash 操作较慢，需要耐心等待
 5. 烧录完成后复位设备（reset_target()）"""

@@ -1,8 +1,9 @@
 """JLink 设备管理器 - 单例模式管理 JLink 连接."""
 
 import pylink
-from typing import Optional, List
+from typing import Optional, List, Callable
 from contextlib import contextmanager
+from threading import RLock
 
 from .exceptions import (
     JLinkMCPError,
@@ -46,6 +47,11 @@ class JLinkManager:
         self._target_interface: TargetInterface = TargetInterface.SWD
         self._target_connected: bool = False
         self._device_name: Optional[str] = None
+        self._session_id = 0
+        self._reservation: Optional[str] = None
+        self._lock = RLock()
+        self._cleanup_callbacks: List[Callable] = []
+        self._close_failed = False
 
         JLinkManager._initialized = True
         logger.debug("JLinkManager 初始化完成")
@@ -53,7 +59,7 @@ class JLinkManager:
     @property
     def is_connected(self) -> bool:
         """检查是否已连接到 JLink 设备."""
-        if self._jlink is None:
+        if self._jlink is None or self._close_failed:
             return False
         try:
             # 尝试访问设备属性来验证连接
@@ -109,6 +115,20 @@ class JLinkManager:
             return []
 
     def connect(
+        self,
+        serial_number: Optional[str] = None,
+        interface: TargetInterface = TargetInterface.SWD,
+        chip_name: Optional[str] = None,
+        jlink_path: Optional[str] = None
+    ) -> None:
+        """连接探针；GDB 持有设备期间禁止重新打开连接。"""
+        with self._lock:
+            self._ensure_not_reserved()
+            if self._jlink is not None and not self.is_connected:
+                self._cleanup()
+            self._connect(serial_number, interface, chip_name, jlink_path)
+
+    def _connect(
         self,
         serial_number: Optional[str] = None,
         interface: TargetInterface = TargetInterface.SWD,
@@ -221,6 +241,7 @@ class JLinkManager:
 
             self._connected = True
             self._device_serial = str(self._jlink.serial_number)
+            self._session_id += 1
 
             logger.info(f"成功连接到设备: {self._device_serial}")
 
@@ -275,27 +296,86 @@ class JLinkManager:
 
     def disconnect(self) -> None:
         """断开 JLink 连接."""
-        if not self.is_connected:
-            logger.debug("没有活动的连接")
-            return
+        with self._lock:
+            self._cleanup(raise_on_close_error=True)
+            logger.info("连接已断开")
 
-        logger.info("正在断开连接")
-        self._cleanup()
-        logger.info("连接已断开")
+    @property
+    def session_id(self) -> int:
+        """连接代次，断开或重新连接后旧 RTT 状态必须失效。"""
+        return self._session_id
 
-    def _cleanup(self) -> None:
+    def add_cleanup_callback(self, callback: Callable) -> None:
+        """注册连接资源清理回调，参数为即将关闭的探针实例。"""
+        if callback not in self._cleanup_callbacks:
+            self._cleanup_callbacks.append(callback)
+
+    def reserve_for_gdb(self, transfer_connection: bool = False) -> dict:
+        """显式将当前连接交给 GDB，直到 GDB 结束才允许 MCP 重新连接。"""
+        with self._lock:
+            self._ensure_not_reserved()
+            connected = self.is_connected
+            if connected and not transfer_connection:
+                raise ConnectionError(
+                    "JLink 当前由 MCP 占用；请设置 transfer_connection=True 显式交给 GDB。"
+                    "交接会停止 RTT 并关闭 MCP 连接，GDB 停止后需手动重新连接。"
+                )
+            connection = {
+                "device": self._device_name if connected else None,
+                "serial_number": self._device_serial if connected else None,
+                "interface": self._target_interface if connected else TargetInterface.SWD,
+            }
+            self._cleanup(raise_on_close_error=True)
+            self._reservation = "GDB Server"
+            return connection
+
+    def release_gdb_reservation(self) -> None:
+        with self._lock:
+            if self._reservation == "GDB Server":
+                self._reservation = None
+
+    def _ensure_not_reserved(self) -> None:
+        if self._close_failed:
+            raise ConnectionError(
+                "上一次关闭 JLink 失败，旧句柄仍保留；请先调用 disconnect_device 重试关闭，"
+                "成功前禁止重新连接或交给 GDB"
+            )
+        if self._reservation:
+            raise ConnectionError(f"JLink 已保留给 {self._reservation}，请先调用 stop_gdb_server")
+
+    def _cleanup(self, raise_on_close_error: bool = False) -> None:
         """清理资源."""
-        if self._jlink:
+        close_error = None
+        if self._jlink is not None:
+            retrying_failed_close = self._close_failed
+            for callback in self._cleanup_callbacks:
+                try:
+                    callback(self._jlink)
+                except Exception as e:
+                    logger.warning(f"清理连接资源时出错: {e}")
             try:
                 self._jlink.close()
+                # PyLink 在调用 DLL 前会减少 open 引用计数，失败后的再次 close
+                # 可能直接返回；因此重试还要确认 DLL 确实已关闭。
+                if retrying_failed_close and self._jlink.opened():
+                    raise ConnectionError("驱动仍显示打开，不能释放旧句柄；请重启 MCP 后重试")
             except Exception as e:
                 logger.warning(f"关闭连接时出错: {e}")
-            finally:
+                close_error = e
+                self._close_failed = True
+            else:
                 self._jlink = None
+                self._close_failed = False
+            finally:
+                self._session_id += 1
 
         self._connected = False
-        self._device_serial = None
         self._target_connected = False
+        if self._jlink is None:
+            self._device_serial = None
+            self._device_name = None
+        if close_error is not None and raise_on_close_error:
+            raise ConnectionError("未能确认 MCP 连接已关闭；旧句柄已保留，请重试 disconnect_device", close_error)
 
     def get_connection_status(self) -> ConnectionStatus:
         """获取连接状态.
@@ -368,8 +448,8 @@ class JLinkManager:
             except Exception:
                 pass
 
-            # 设备 ID：pylink-square 无 device_id()，用 core_id 代替
-            device_id = core_id
+            # 内核 ID 不等于 MCU 设备 ID；缺少芯片专用读取逻辑时保留未知值。
+            device_id = None
 
             # 获取 Flash 和 RAM 信息
             flash_size = None
@@ -415,6 +495,7 @@ class JLinkManager:
         Raises:
             JLinkMCPError: 如果未连接
         """
+        self._ensure_not_reserved()
         self._ensure_connected()
         return self._jlink
 
@@ -424,7 +505,9 @@ class JLinkManager:
         Raises:
             JLinkMCPError: 如果未连接
         """
+        self._ensure_not_reserved()
         if not self.is_connected:
+            self._cleanup()
             raise JLinkMCPError(
                 JLinkErrorCode.NOT_INITIALIZED,
                 "JLink 未连接"
@@ -454,8 +537,7 @@ class JLinkManager:
         try:
             yield self
         finally:
-            if self.is_connected:
-                self.disconnect()
+            self.disconnect()
 
 
 # 全局单例实例

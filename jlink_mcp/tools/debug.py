@@ -5,7 +5,6 @@ from typing import Dict, Any, List, Optional
 
 from ..jlink_manager import jlink_manager
 from ..exceptions import JLinkMCPError, JLinkErrorCode
-from ..models.operations import DebugBreakpoint, CPUState
 from ..utils import logger
 
 
@@ -30,6 +29,11 @@ def reset_target(reset_type: str = "normal") -> Dict[str, Any]:
         - message: 状态信息
     """
     try:
+        if reset_type not in ("normal", "halt", "core"):
+            raise JLinkMCPError(
+                JLinkErrorCode.INVALID_PARAMETER,
+                f"复位类型必须是 normal/halt/core: {reset_type}"
+            )
         jlink = jlink_manager.get_jlink()
 
         if reset_type == "halt":
@@ -38,12 +42,12 @@ def reset_target(reset_type: str = "normal") -> Dict[str, Any]:
         elif reset_type == "core":
             # 内核复位：仅复位内核，不拉硬件复位引脚（外设状态保留）
             logger.info("执行内核复位")
+            import pylink
+            previous_strategy = jlink.set_reset_strategy(pylink.JLinkResetStrategyCortexM3.CORE)
             try:
-                import pylink
-                jlink.set_reset_strategy(pylink.JLinkResetStrategyCortexM3.CORE)
-            except Exception as e:
-                logger.warning(f"设置内核复位策略失败（回退普通复位并暂停）: {e}")
-            jlink.reset(ms=0, halt=True)
+                jlink.reset(ms=0, halt=True)
+            finally:
+                jlink.set_reset_strategy(previous_strategy)
         else:  # normal
             logger.info("执行普通复位")
             jlink.reset(ms=0, halt=False)

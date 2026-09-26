@@ -323,7 +323,7 @@ BEST_PRACTICES = {
         "recommended_flow": [
             "1. connect_device(chip_name, interface) - 连接设备",
             "2. halt_cpu() - 暂停 CPU（Flash 操作前建议暂停）",
-            "3. erase_flash(chip_erase=True) - 整片擦除（或指定范围）",
+            "3. 按需使用 erase_sector；整片擦除必须显式 erase_flash(chip_erase=True)",
             "4. program_flash(address, data, verify=True) - 烧录固件",
             "5. verify_flash(address, data) - 校验烧录结果（可选）"
         ],
@@ -406,11 +406,23 @@ def get_usage_guidance(category: str | None = None, include_examples: bool = Tru
 
         # 筛选分类
         if category:
-            category_lower = category.lower()
+            aliases = {
+                "connection": "连接管理", "device_info": "设备信息",
+                "memory": "内存操作", "flash": "Flash 操作",
+                "debug": "调试控制", "rtt": "RTT", "svd": "SVD",
+                "gdb": "GDB Server", "gdb_server": "GDB Server", "guidance": "辅助信息",
+            }
+            category_lower = aliases.get(category.lower(), category).lower()
             filtered_categories = {
                 k: v for k, v in TOOL_CATEGORIES.items()
                 if k.lower() == category_lower or category_lower in k.lower()
             }
+            if not filtered_categories:
+                return {
+                    "success": False,
+                    "error": f"未知工具分类: {category}",
+                    "available_categories": list(aliases),
+                }
         else:
             filtered_categories = TOOL_CATEGORIES
 

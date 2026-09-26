@@ -73,6 +73,10 @@ def validate_address(address: int, size: int = 4) -> None:
     Raises:
         ValueError: 如果地址无效
     """
+    if not isinstance(address, int) or isinstance(address, bool):
+        raise ValueError("地址必须是整数")
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        raise ValueError("访问大小必须是正整数")
     if address < 0:
         raise ValueError(f"地址不能为负数: {address}")
     if address % size != 0:

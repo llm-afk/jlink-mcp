@@ -1,11 +1,12 @@
 """Flash 操作工具函数."""
 
 from typing import Dict, Any, Optional
+from itertools import zip_longest
 
 from ..jlink_manager import jlink_manager
 from ..exceptions import JLinkMCPError, JLinkErrorCode
-from ..models.operations import FlashEraseRequest, FlashProgramRequest
 from ..utils import logger, human_readable_size, parse_hex_string
+from .memory import _read_memory_bytes, _validate_memory_access
 
 # 校验失败时最多返回的不匹配条数（避免大固件校验失败时输出几 MB 的 mismatch 列表）
 _MAX_MISMATCHES = 100
@@ -18,7 +19,7 @@ def _build_verify_result(data_bytes, read_back_bytes, address):
 
     total = 0
     mismatches = []
-    for i, (a, b) in enumerate(zip(data_bytes, read_back_bytes)):
+    for i, (a, b) in enumerate(zip_longest(data_bytes, read_back_bytes)):
         if a != b:
             total += 1
             if len(mismatches) < _MAX_MISMATCHES:
@@ -32,6 +33,15 @@ def _build_verify_result(data_bytes, read_back_bytes, address):
     }
 
 
+def _read_flash_bytes(jlink, address: int, size: int) -> bytes:
+    """Bound each hardware read and reject incomplete firmware readbacks."""
+    chunk_size = 65536
+    return b"".join(
+        _read_memory_bytes(jlink, address + offset, min(chunk_size, size - offset), 8)
+        for offset in range(0, size, chunk_size)
+    )
+
+
 def erase_flash(
     start_address: Optional[int] = None,
     end_address: Optional[int] = None,
@@ -40,9 +50,9 @@ def erase_flash(
     """擦除 Flash.
 
     Args:
-        start_address: 起始地址（可选）
-        end_address: 结束地址（可选）
-        chip_erase: 是否整片擦除（默认 False）
+        start_address: 不支持范围擦除，指定范围请改用 erase_sector
+        end_address: 不支持范围擦除，指定范围请改用 erase_sector
+        chip_erase: 必须显式指定 True 才会整片擦除（含 bootloader）
 
     Returns:
         包含以下字段的字典:
@@ -52,34 +62,21 @@ def erase_flash(
         - message: 状态信息
     """
     try:
-        jlink = jlink_manager.get_jlink()
-
-        if chip_erase:
-            # 整片擦除
-            logger.info("执行整片擦除")
-            jlink.erase()
-            erase_type = "chip"
-            bytes_erased = 0  # 整片擦除无法知道具体字节数
-        elif start_address is not None and end_address is not None:
-            # 指定范围擦除
-            if start_address >= end_address:
-                raise JLinkMCPError(
-                    JLinkErrorCode.INVALID_PARAMETER,
-                    f"起始地址 {start_address:#x} 必须小于结束地址 {end_address:#x}"
-                )
-
-            size = end_address - start_address
-            logger.info(f"擦除 Flash {start_address:#x} - {end_address:#x} ({human_readable_size(size)})")
-
-            # pylink-square 无分扇区擦除接口，只能整片擦除
-            jlink.erase()
-            erase_type = "chip"
-            bytes_erased = 0  # 整片擦除无法知道具体字节数
-        else:
+        if start_address is not None or end_address is not None:
             raise JLinkMCPError(
                 JLinkErrorCode.INVALID_PARAMETER,
-                "必须指定 chip_erase=True 或提供 start_address 和 end_address"
+                "erase_flash 不支持范围擦除；请使用 erase_sector(address, count, page_size)"
             )
+        if chip_erase is not True:
+            raise JLinkMCPError(
+                JLinkErrorCode.INVALID_PARAMETER,
+                "整片擦除必须显式指定 chip_erase=True；指定范围请使用 erase_sector"
+            )
+        jlink = jlink_manager.get_jlink()
+        logger.info("执行整片擦除")
+        jlink.erase()
+        erase_type = "chip"
+        bytes_erased = 0  # 整片擦除无法知道具体字节数
 
         logger.info("Flash 擦除成功")
         message = f"Flash 擦除成功（{erase_type}）"
@@ -141,18 +138,20 @@ def erase_sector(address: int, count: int = 1, page_size: int = 1024) -> Dict[st
         - message: 状态信息
     """
     try:
-        if count <= 0:
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
             raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, "count 必须 >= 1")
-        if page_size <= 0 or (page_size & (page_size - 1)) != 0:
+        if (not isinstance(page_size, int) or isinstance(page_size, bool)
+                or page_size <= 0 or (page_size & (page_size - 1)) != 0):
             raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, "page_size 必须是 2 的幂")
-
-        jlink = jlink_manager.get_jlink()
+        _validate_memory_access(address, 1, 8)
 
         # 对齐到页边界
         page_mask = ~(page_size - 1)
         start_address = address & page_mask
         end_address = start_address + count * page_size
         total_bytes = count * page_size
+        _validate_memory_access(start_address, total_bytes, 8)
+        jlink = jlink_manager.get_jlink()
 
         logger.info(f"按扇区擦除 Flash: {start_address:#x} - {end_address:#x} "
                     f"({count} 页 × {page_size} B)")
@@ -164,7 +163,7 @@ def erase_sector(address: int, count: int = 1, page_size: int = 1024) -> Dict[st
         chunk = 0x10000  # 64KB
         for off in range(0, total_bytes, chunk):
             n = min(chunk, total_bytes - off)
-            read_back = bytes(jlink.memory_read(start_address + off, n))
+            read_back = _read_memory_bytes(jlink, start_address + off, n, 8)
             if not all(b == 0xFF for b in read_back):
                 raise JLinkMCPError(
                     JLinkErrorCode.ERASE_FAILED,
@@ -224,8 +223,11 @@ def program_flash(address: int, data: str | None = None, verify: bool = True, fi
         - verify_result: 校验结果（如果 verify=True）
         - message: 状态信息
     """
+    bytes_programmed = 0
     try:
-        # 解析烧录数据：优先从文件读取，否则解析 hex 字符串
+        if data is not None and file_path is not None:
+            raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, "data 和 file_path 只能提供一个")
+        # 从文件或十六进制字符串读取烧录数据。
         if file_path:
             with open(file_path, 'rb') as f:
                 data_bytes = f.read()
@@ -234,17 +236,18 @@ def program_flash(address: int, data: str | None = None, verify: bool = True, fi
         else:
             raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, "必须提供 data 或 file_path")
 
+        _validate_memory_access(address, len(data_bytes), 8)
         jlink = jlink_manager.get_jlink()
 
         logger.info(f"烧录 Flash {address:#x} 大小 {human_readable_size(len(data_bytes))}")
         jlink.flash(data_bytes, address)
+        bytes_programmed = len(data_bytes)
 
         verify_result = None
         if verify:
             # 校验
             logger.info("校验 Flash")
-            read_back = jlink.memory_read(address, len(data_bytes))
-            read_back_bytes = bytes(read_back)  # 统一为 bytes，避免 list/bytes 比较恒为 False
+            read_back_bytes = _read_flash_bytes(jlink, address, len(data_bytes))
 
             verify_result = _build_verify_result(data_bytes, read_back_bytes, address)
             if verify_result["matched"]:
@@ -252,21 +255,26 @@ def program_flash(address: int, data: str | None = None, verify: bool = True, fi
             else:
                 logger.warning(f"Flash 校验失败，{verify_result['mismatch_count']} 处不匹配")
 
-        logger.info("Flash 烧录成功")
+        matched = verify_result is None or verify_result["matched"]
+        if matched:
+            logger.info("Flash 烧录成功")
         msg = f"成功烧录 {human_readable_size(len(data_bytes))} 到 Flash"
         if verify_result is not None and not verify_result["matched"]:
             msg += f"（但校验失败：{verify_result['mismatch_count']} 处不匹配）"
-        return {
-            "success": True,
-            "bytes_programmed": len(data_bytes),
+        result = {
+            "success": matched,
+            "bytes_programmed": bytes_programmed,
             "verify_result": verify_result,
             "message": msg
         }
+        if not matched:
+            result["error"] = JLinkMCPError(JLinkErrorCode.VERIFY_FAILED).to_dict()
+        return result
     except JLinkMCPError as e:
         logger.error(f"烧录 Flash 失败: {e}")
         return {
             "success": False,
-            "bytes_programmed": 0,
+            "bytes_programmed": bytes_programmed,
             "verify_result": None,
             "error": e.to_dict()
         }
@@ -274,7 +282,7 @@ def program_flash(address: int, data: str | None = None, verify: bool = True, fi
         logger.error(f"烧录 Flash 失败: {e}")
         return {
             "success": False,
-            "bytes_programmed": 0,
+            "bytes_programmed": bytes_programmed,
             "verify_result": None,
             "error": {
                 "code": JLinkErrorCode.VERIFY_FAILED.value[0],
@@ -303,10 +311,10 @@ def verify_flash(address: int, data: str) -> Dict[str, Any]:
             raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, "数据不能为空")
 
         data_bytes = parse_hex_string(data)
+        _validate_memory_access(address, len(data_bytes), 8)
 
         jlink = jlink_manager.get_jlink()
-        read_back = jlink.memory_read(address, len(data_bytes))
-        read_back_bytes = bytes(read_back)  # 统一为 bytes，避免 list/bytes 比较恒为 False
+        read_back_bytes = _read_flash_bytes(jlink, address, len(data_bytes))
 
         verify_result = _build_verify_result(data_bytes, read_back_bytes, address)
 

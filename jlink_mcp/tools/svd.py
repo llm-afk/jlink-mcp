@@ -9,6 +9,7 @@ from ..svd_manager import svd_manager
 from ..jlink_manager import jlink_manager
 from ..exceptions import JLinkMCPError, JLinkErrorCode
 from ..utils import logger
+from .memory import _read_memory_bytes, _write_memory_bytes, _validate_memory_access
 
 
 def list_svd_devices() -> Dict[str, Any]:
@@ -236,9 +237,10 @@ def read_register_with_fields(
         # 计算绝对地址
         absolute_address = peripheral.base_address + register.address_offset
 
+        _validate_memory_access(absolute_address, register.size // 8, register.size)
         # 从目标设备读取寄存器值
         jlink = jlink_manager.get_jlink()
-        data = jlink.memory_read(absolute_address, 4)  # 读取 4 字节
+        data = _read_memory_bytes(jlink, absolute_address, register.size // 8, register.size)
         raw_value = int.from_bytes(data, byteorder='little')
 
         # 解析字段（使用预计算的 bit_mask，兼容未计算的情况）
@@ -411,6 +413,7 @@ def read_register_by_address(
             )
 
         num_bytes = width // 8
+        _validate_memory_access(address, num_bytes, width)
 
         jlink = jlink_manager.get_jlink()
 
@@ -422,7 +425,7 @@ def read_register_by_address(
         except Exception:
             pass
 
-        data = jlink.memory_read(address, num_bytes)
+        data = _read_memory_bytes(jlink, address, num_bytes, width)
         raw_value = int.from_bytes(data, byteorder='little')
 
         result = {
@@ -506,9 +509,10 @@ def write_register_by_address(
 
         num_bytes = width // 8
         data = value.to_bytes(num_bytes, byteorder='little')
+        _validate_memory_access(address, num_bytes, width)
 
         jlink = jlink_manager.get_jlink()
-        jlink.memory_write(address, data)
+        _write_memory_bytes(jlink, address, data, width)
 
         logger.info(f"按地址写入寄存器 {address:#x} = {value:#x}")
 

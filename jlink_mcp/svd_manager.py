@@ -4,7 +4,7 @@
 
 优化特性:
 - 延迟加载: 只在首次访问设备时加载对应的 SVD 文件
-- Pickle 缓存: 解析后的数据缓存到磁盘，热启动极速加载
+- JSON 缓存: 解析后的数据缓存到用户目录
 - 索引查找: 外设和寄存器使用字典索引，O(1) 复杂度
 - 预计算: 字段 mask 值和枚举字典在解析时预计算
 - 缓存: 使用 LRU 缓存频繁查询的结果
@@ -12,11 +12,14 @@
 
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Tuple
-from functools import lru_cache
+from functools import lru_cache, wraps
+from threading import RLock
+from copy import deepcopy
 import xml.etree.ElementTree as ET
-import pickle
+import json
 import hashlib
 import os
+import tempfile
 
 from .models.svd import (
     DeviceSVD, PeripheralInfo, RegisterInfo, FieldInfo,
@@ -25,24 +28,36 @@ from .models.svd import (
 from .utils import logger
 
 
+def _synchronized(method):
+    """元数据与硬件工作线程共享同一 SVD 管理器。"""
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return locked
+
+
 class SVDManager:
     """SVD 文件管理器（单例模式）.
 
     负责加载和解析所有 SVD 文件，提供芯片、外设、寄存器、字段的查询接口。
-    使用延迟加载、Pickle 缓存和索引优化查询性能。
+    使用延迟加载、JSON 缓存和索引优化查询性能。
     """
 
     _instance: Optional["SVDManager"] = None
     _initialized: bool = False
+    _lock = RLock()
 
     # 缓存版本号，当模型结构变化时需要更新
-    CACHE_VERSION = 3
+    CACHE_VERSION = 4
 
     def __new__(cls) -> "SVDManager":
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+            return cls._instance
 
+    @_synchronized
     def __init__(self):
         if SVDManager._initialized:
             return
@@ -58,10 +73,8 @@ class SVDManager:
             self._svd_path = current_dir / "tool" / "SVD_V1.5.6"
             logger.info(f"使用包内SVD目录: {self._svd_path}")
 
-        # Pickle 缓存目录
-        current_dir = Path(__file__).resolve().parent
-        self._cache_dir = current_dir / ".svd_cache"
-        self._cache_dir.mkdir(exist_ok=True)
+        # 缓存不可写时仍允许解析 SVD，不依赖包安装目录的写权限。
+        self._cache_dir: Optional[Path] = self._create_cache_dir()
 
         # 存储已加载的设备 SVD 数据
         self._devices: Dict[str, DeviceSVD] = {}
@@ -95,58 +108,102 @@ class SVDManager:
 
         logger.info(f"扫描发现 {len(self._svd_file_map)} 个 SVD 文件")
 
-    def _get_cache_path(self, device_name: str) -> Path:
-        """获取设备的缓存文件路径."""
-        return self._cache_dir / f"{device_name}.v{self.CACHE_VERSION}.pkl"
-
-    def _is_cache_valid(self, svd_path: Path, cache_path: Path) -> bool:
-        """检查缓存是否有效.
-
-        缓存有效的条件：
-        1. 缓存文件存在
-        2. 缓存文件的修改时间晚于 SVD 文件
-        3. 缓存版本匹配
-        """
-        if not cache_path.exists():
-            return False
-        # 检查修改时间
-        return cache_path.stat().st_mtime > svd_path.stat().st_mtime
-
-    def _load_from_cache(self, device_name: str) -> Optional[DeviceSVD]:
-        """从 Pickle 缓存加载设备数据."""
-        cache_path = self._get_cache_path(device_name)
-        svd_path = self._svd_file_map.get(device_name)
-        
-        if svd_path and not self._is_cache_valid(svd_path, cache_path):
-            logger.debug(f"缓存已过期或不存在: {device_name}")
+    @staticmethod
+    def _create_cache_dir() -> Optional[Path]:
+        """选择当前用户的缓存目录；创建失败时禁用磁盘缓存。"""
+        try:
+            if os.name == "nt":
+                base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+            else:
+                base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+            cache_dir = base / "jlink-mcp" / "svd"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            return cache_dir
+        except (OSError, RuntimeError) as exc:
+            logger.warning(f"SVD 磁盘缓存不可用，将直接解析文件: {exc}")
             return None
 
+    def _get_cache_path(self, device_name: str) -> Optional[Path]:
+        """缓存按源文件绝对路径隔离，同名的外部 SVD 不共享缓存。"""
+        source = self._svd_file_map.get(device_name)
+        if self._cache_dir is None or source is None:
+            return None
+        identity = os.path.normcase(str(source.resolve()))
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        return self._cache_dir / f"{digest}.v{self.CACHE_VERSION}.json"
+
+    @staticmethod
+    def _source_signature(svd_path: Path) -> Dict[str, Any]:
+        """内容签名可识别保留修改时间的文件替换。"""
+        return {
+            "path": os.path.normcase(str(svd_path.resolve())),
+            "sha256": hashlib.sha256(svd_path.read_bytes()).hexdigest(),
+        }
+
+    def _is_cache_valid(self, svd_path: Path, cache_path: Path) -> bool:
+        """检查缓存版本、来源及文件内容是否匹配。"""
         try:
-            with open(cache_path, 'rb') as f:
-                device = pickle.load(f)
-                logger.info(f"从缓存加载 SVD: {device_name}")
-                return device
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            return (cached.get("version") == self.CACHE_VERSION
+                    and cached.get("source") == self._source_signature(svd_path))
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+
+    def _load_from_cache(self, device_name: str) -> Optional[DeviceSVD]:
+        """从 JSON 缓存加载并验证模型，不反序列化可执行对象。"""
+        try:
+            cache_path = self._get_cache_path(device_name)
+            svd_path = self._svd_file_map.get(device_name)
+            if cache_path is None or svd_path is None or not cache_path.exists():
+                return None
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if (cached.get("version") != self.CACHE_VERSION
+                    or cached.get("source") != self._source_signature(svd_path)):
+                return None
+            device = DeviceSVD.model_validate(cached["device"])
+            logger.info(f"从缓存加载 SVD: {device_name}")
+            return device
         except Exception as e:
             logger.warning(f"加载缓存失败 {device_name}: {e}")
             return None
 
     def _save_to_cache(self, device_name: str, device: DeviceSVD) -> None:
-        """保存设备数据到 Pickle 缓存."""
-        cache_path = self._get_cache_path(device_name)
+        """原子写入 JSON，缓存故障不影响查询。"""
+        temporary_path = None
         try:
-            with open(cache_path, 'wb') as f:
-                pickle.dump(device, f)
-                logger.debug(f"保存缓存: {device_name}")
+            cache_path = self._get_cache_path(device_name)
+            if cache_path is None:
+                return
+            payload = {
+                "version": self.CACHE_VERSION,
+                "source": self._source_signature(self._svd_file_map[device_name]),
+                "device": device.model_dump(mode="json"),
+            }
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self._cache_dir,
+                                             prefix="svd-", suffix=".tmp", delete=False) as f:
+                temporary_path = Path(f.name)
+                json.dump(payload, f, ensure_ascii=False)
+            temporary_path.replace(cache_path)
+            logger.debug(f"保存缓存: {device_name}")
         except Exception as e:
             logger.warning(f"保存缓存失败 {device_name}: {e}")
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
+    @_synchronized
     def clear_cache_dir(self) -> None:
-        """清除所有 Pickle 缓存文件."""
-        import shutil
-        if self._cache_dir.exists():
-            shutil.rmtree(self._cache_dir)
-            self._cache_dir.mkdir(exist_ok=True)
-            logger.info("已清除所有 SVD 缓存")
+        """清除本版本的磁盘缓存，不删除目录中的其他文件。"""
+        if self._cache_dir is not None:
+            try:
+                for path in self._cache_dir.glob(f"*.v{self.CACHE_VERSION}.json"):
+                    path.unlink(missing_ok=True)
+                logger.info("已清除所有 SVD 缓存")
+            except OSError as exc:
+                logger.warning(f"清除 SVD 缓存失败: {exc}")
 
     def _ensure_device_loaded(self, device_name: str) -> bool:
         """确保指定设备的 SVD 已加载.
@@ -168,6 +225,8 @@ class SVDManager:
             matched_name = self._find_matching_device(device_name)
             if matched_name:
                 device_name = matched_name
+                if device_name in self._devices:
+                    return True
                 svd_file = self._svd_file_map.get(device_name)
             else:
                 # 设备不在文件映射中，但可能已通过其他方式添加（如测试）
@@ -258,6 +317,7 @@ class SVDManager:
         """解析单个 SVD 文件."""
         tree = ET.parse(svd_path)
         root = tree.getroot()
+        self._expand_inheritance(root)
 
         # 解析设备基本信息
         device = DeviceSVD(
@@ -269,31 +329,116 @@ class SVDManager:
             peripherals=[]
         )
 
-        # 解析外设（两遍：先解析所有外设，再展开 derivedFrom 继承的寄存器）
         peripherals = root.find("peripherals")
         if peripherals is not None:
-            peripheral_elements = peripherals.findall("peripheral")
-            derived_from_map = {}
-
-            # 第一遍：解析所有外设，并记录 derivedFrom 关系
-            for peripheral in peripheral_elements:
-                name = peripheral.findtext("name", "")
-                derived = peripheral.get("derivedFrom")
-                if derived:
-                    derived_from_map[name] = derived
-                device.peripherals.append(self._parse_peripheral(peripheral))
-
-            # 第二遍：展开 derivedFrom（继承目标外设的寄存器，如 GPIOB derivedFrom GPIOA）
-            if derived_from_map:
-                name_to_peripheral = {p.name: p for p in device.peripherals}
-                for name, derived in derived_from_map.items():
-                    target = name_to_peripheral.get(derived)
-                    peripheral = name_to_peripheral.get(name)
-                    if target and peripheral and not peripheral.registers:
-                        peripheral.registers = list(target.registers)
-                        logger.debug(f"外设 {name} 从 {derived} 继承了 {len(peripheral.registers)} 个寄存器")
+            defaults = self._register_properties(root)
+            for peripheral in peripherals.findall("peripheral"):
+                device.peripherals.append(self._parse_peripheral(peripheral, defaults))
 
         return device
+
+    @staticmethod
+    def _merge_elements(base, override):
+        """复制继承内容，再按名称合并寄存器/字段及本地属性。"""
+        merged = deepcopy(base)
+        merged.attrib.update(override.attrib)
+        for child in override:
+            name = child.findtext("name")
+            existing = next((item for item in merged
+                             if item.tag == child.tag and item.findtext("name") == name), None)
+            if existing is not None:
+                index = list(merged).index(existing)
+                merged.remove(existing)
+                replacement = (SVDManager._merge_elements(existing, child)
+                               if len(child) else deepcopy(child))
+                merged.insert(index, replacement)
+            else:
+                merged.append(deepcopy(child))
+        return merged
+
+    @classmethod
+    def _expand_inheritance(cls, root) -> None:
+        """递归展开外设和寄存器继承，支持前向引用并拒绝循环/缺失引用。"""
+        container = root.find("peripherals")
+        if container is None:
+            return
+        originals = {p.findtext("name", ""): p for p in container.findall("peripheral")}
+        resolved = {}
+        visiting = set()
+
+        def peripheral(name):
+            if name in resolved:
+                return resolved[name]
+            if name in visiting:
+                raise ValueError(f"SVD 外设继承循环: {name}")
+            if name not in originals:
+                raise ValueError(f"SVD 继承外设不存在: {name}")
+            visiting.add(name)
+            element = originals[name]
+            parent = element.get("derivedFrom")
+            result = cls._merge_elements(peripheral(parent), element) if parent else deepcopy(element)
+            result.attrib.pop("derivedFrom", None)
+            visiting.remove(name)
+            resolved[name] = result
+            return result
+
+        for name in originals:
+            peripheral(name)
+
+        registers = {}
+        for name, element in resolved.items():
+            for register in element.findall("registers/register"):
+                registers[(name, register.findtext("name", ""))] = register
+        resolved_registers = {}
+        visiting_registers = set()
+
+        def register(key):
+            if key in resolved_registers:
+                return resolved_registers[key]
+            if key in visiting_registers:
+                raise ValueError(f"SVD 寄存器继承循环: {'.'.join(key)}")
+            if key not in registers:
+                raise ValueError(f"SVD 继承寄存器不存在: {'.'.join(key)}")
+            visiting_registers.add(key)
+            element = registers[key]
+            parent = element.get("derivedFrom")
+            if parent:
+                parent_key = tuple(parent.split(".", 1)) if "." in parent else (key[0], parent)
+                result = cls._merge_elements(register(parent_key), element)
+            else:
+                result = deepcopy(element)
+            result.attrib.pop("derivedFrom", None)
+            defaults = cls._register_properties(resolved[key[0]], cls._register_properties(root))
+            for tag, value in defaults.items():
+                if result.find(tag) is None:
+                    ET.SubElement(result, tag).text = value
+            visiting_registers.remove(key)
+            resolved_registers[key] = result
+            return result
+
+        for name in originals:
+            element = resolved[name]
+            register_container = element.find("registers")
+            if register_container is not None:
+                for old in list(register_container):
+                    if old.tag == "register":
+                        index = list(register_container).index(old)
+                        register_container.remove(old)
+                        register_container.insert(index, register((name, old.findtext("name", ""))))
+        for old in list(container):
+            if old.tag == "peripheral":
+                index = list(container).index(old)
+                container.remove(old)
+                container.insert(index, resolved[old.findtext("name", "")])
+
+    @staticmethod
+    def _register_properties(element, inherited=None):
+        properties = dict(inherited or {})
+        for tag in ("size", "access", "resetValue"):
+            value = element.findtext(tag)
+            if value is not None:
+                properties[tag] = value
+        return properties
 
     def _parse_cpu(self, cpu_element) -> CPUInfo:
         """解析 CPU 信息."""
@@ -309,13 +454,14 @@ class SVDManager:
             nvic_prio_bits=self._parse_int(cpu_element.findtext("nvicPrioBits", "0"))
         )
 
-    def _parse_peripheral(self, peripheral) -> PeripheralInfo:
+    def _parse_peripheral(self, peripheral, inherited=None) -> PeripheralInfo:
         """解析外设信息."""
+        defaults = self._register_properties(peripheral, inherited)
         registers_element = peripheral.find("registers")
         registers = []
         if registers_element is not None:
             for register in registers_element.findall("register"):
-                registers.append(self._parse_register(register))
+                registers.append(self._parse_register(register, defaults))
 
         return PeripheralInfo(
             name=peripheral.findtext("name", ""),
@@ -325,21 +471,25 @@ class SVDManager:
             registers=registers
         )
 
-    def _parse_register(self, register) -> RegisterInfo:
+    def _parse_register(self, register, inherited=None) -> RegisterInfo:
         """解析寄存器信息."""
+        defaults = self._register_properties(register, inherited)
         fields_element = register.find("fields")
         fields = []
         if fields_element is not None:
             for field in fields_element.findall("field"):
-                fields.append(self._parse_field(field))
+                parsed_field = self._parse_field(field)
+                if parsed_field.access is None:
+                    parsed_field.access = defaults.get("access")
+                fields.append(parsed_field)
 
         return RegisterInfo(
             name=register.findtext("name", ""),
             description=register.findtext("description"),
             address_offset=self._parse_int(register.findtext("addressOffset", "0")),
-            size=self._parse_int(register.findtext("size", "32")),
-            access=register.findtext("access"),
-            reset_value=self._parse_int(register.findtext("resetValue")),
+            size=self._parse_int(defaults.get("size", "32")),
+            access=defaults.get("access"),
+            reset_value=self._parse_int(defaults.get("resetValue")),
             fields=fields
         )
 
@@ -391,15 +541,18 @@ class SVDManager:
 
     # ==================== 查询接口 ====================
 
+    @_synchronized
     def is_available(self) -> bool:
         """检查 SVD 是否可用."""
         return len(self._svd_file_map) > 0
 
     @property
+    @_synchronized
     def device_names(self) -> List[str]:
         """获取所有设备名称."""
         return list(self._svd_file_map.keys())
 
+    @_synchronized
     def get_device(self, device_name: str) -> Optional[DeviceSVD]:
         """获取指定设备的 SVD 信息."""
         if self._ensure_device_loaded(device_name):
@@ -422,6 +575,7 @@ class SVDManager:
                 return tuple(device.peripherals)
         return ()
 
+    @_synchronized
     def get_peripherals(self, device_name: str) -> List[PeripheralInfo]:
         """获取指定设备的所有外设.
 
@@ -430,6 +584,7 @@ class SVDManager:
         """
         return list(self._get_peripherals_cached(device_name))
 
+    @_synchronized
     def get_peripheral(self, device_name: str, peripheral_name: str) -> Optional[PeripheralInfo]:
         """获取指定外设（O(1) 索引查找，索引不存在时回退到线性查找）."""
         if self._ensure_device_loaded(device_name):
@@ -448,6 +603,7 @@ class SVDManager:
                         return peripheral
         return None
 
+    @_synchronized
     def get_register(self, device_name: str, peripheral_name: str, register_name: str) -> Optional[RegisterInfo]:
         """获取指定寄存器（O(1) 索引查找，索引不存在时回退到线性查找）."""
         if self._ensure_device_loaded(device_name):
@@ -467,6 +623,7 @@ class SVDManager:
                         return register
         return None
 
+    @_synchronized
     def parse_register_value(
         self,
         device_name: str,
@@ -522,6 +679,7 @@ class SVDManager:
             "fields": field_results
         }
 
+    @_synchronized
     def find_register_by_address(
         self,
         device_name: str,
@@ -553,6 +711,7 @@ class SVDManager:
                     return peripheral, register
         return None
 
+    @_synchronized
     def clear_cache(self) -> None:
         """清除查询缓存."""
         self._get_peripherals_cached.cache_clear()
