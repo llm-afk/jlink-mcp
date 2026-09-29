@@ -5,7 +5,6 @@ from typing import Dict, Any, List, Optional
 
 from ..jlink_manager import jlink_manager
 from ..exceptions import JLinkMCPError, JLinkErrorCode
-from ..models.operations import DebugBreakpoint, CPUState
 from ..utils import logger
 from ..target_access import ensure_halted
 

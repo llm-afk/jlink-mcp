@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "name": "c1_driver / GD32C103CB",
+  "chip": "GD32C103CB",
+  "interface": "SWD",
+  "architecture": "cortex-m",
+  "svd_device": "GD32C10x",
+  "elf_path": "../../c1_driver/Firmware_app/MDK-ARM/object/dgm_app_fw.axf",
+  "regions": [
+    {"name": "firmware", "address": 134217728, "size": 119808, "kind": "flash"},
+    {"name": "eeprom_pages_117_127", "address": 134337536, "size": 11264, "kind": "flash", "mutable": true},
+    {"name": "sram", "address": 536870912, "size": 32768, "kind": "ram", "mutable": true}
+  ],
+  "debug_checks": [
+    {
+      "name": "FWDGT frozen while halted",
+      "address": 3758366724,
+      "mask": 256,
+      "expected": 256,
+      "description": "GD32 DBG_CTL.FWDGT_HOLD. Observation only; configuring or restoring this bit must be explicit."
+    }
+  ]
+}

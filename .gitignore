@@ -8,6 +8,7 @@ __pycache__/
 build/
 dist/
 wheels/
+captures/
 
 # 虚拟环境
 .venv/
@@ -27,9 +28,5 @@ env/
 .DS_Store
 Thumbs.db
 
-# Local hardware evidence, firmware backups and copied vendor/build trees.
-/hardware_validation/*
-!/hardware_validation/run_mcp_validation.py
-!/hardware_validation/run_mcp_regression.py
-/audit_20260929.py
-/audit_20260929_results.json
+# Machine-local backups, hardware evidence and release packages.
+.local/

@@ -3,9 +3,8 @@
 from typing import List, Dict, Any
 
 from ..jlink_manager import jlink_manager
-from ..models.device import DeviceInfo, ConnectionStatus, TargetInterface
+from ..models.device import TargetInterface
 from ..utils import logger
-from ..config_manager import config_manager
 
 
 def list_jlink_devices() -> List[Dict[str, Any]]:
@@ -33,7 +32,7 @@ def connect_device(serial_number: str | None = None, interface: str | None = Non
 
     Args:
         serial_number: 设备序列号（可选，None 则连接第一个设备）
-        interface: 目标接口类型，支持 "SWD" 或 "JTAG"（可选，默认从配置读取，默认值为 JTAG）
+        interface: 目标接口类型，支持 "SWD" 或 "JTAG"（可选，默认 SWD）
         chip_name: 目标芯片名称（可选，支持缩写自动匹配，如 FC7300F4MDD）
         jlink_path: 指定 JLink 安装目录或 JLink_x64.dll 文件路径（可选，
             如 D:\\Program Files\\SEGGER\\JLink_V942）；None 则自动选择最新版本
@@ -45,11 +44,9 @@ def connect_device(serial_number: str | None = None, interface: str | None = Non
         - message: 状态信息
     """
     try:
-        # 从配置读取默认接口（如果未指定）
+        # Public session configuration is resolved before calling this adapter.
         if interface is None:
-            config = config_manager.get_config()
-            interface = config.default_interface  # 默认 JTAG
-            logger.debug(f"使用配置的默认接口: {interface}")
+            interface = "SWD"
 
         interface_enum = TargetInterface(interface.upper())
         jlink_manager.connect(serial_number, interface_enum, chip_name, jlink_path)
@@ -142,70 +139,3 @@ def get_connection_status() -> Dict[str, Any]:
                 "suggestion": "请检查 JLink 设备连接状态"
             }
         }
-
-
-def match_chip_name(chip_name: str) -> Dict[str, Any]:
-    """智能匹配芯片名称.
-
-    将简化的芯片名称（如 FC7300F4MDD）匹配到完整的芯片名称
-    （如 FC7300F4MDDxXxxxT1C）。
-
-    支持多种匹配模式：
-    - 精确匹配：FC7300F4MDDxXxxxT1C -> FC7300F4MDDxXxxxT1C
-    - 前缀匹配：FC7300F4MDD -> FC7300F4MDDxXxxxT1C
-    - 包含匹配：FC7300F4MDDS -> FC7300F4MDSxXxxxT1C
-    - 模糊匹配：FC7300F4MDDxT1C -> FC7300F4MDDxXxxxT1C
-
-    Args:
-        chip_name: 芯片名称（可以是简化名称或完整名称）
-
-    Returns:
-        匹配结果，包含:
-        - success: 是否找到匹配
-        - input: 输入的芯片名称
-        - matched: 匹配到的完整名称（如果有）
-        - all_matches: 所有匹配的设备列表
-        - suggestion: 建议信息
-    """
-    from ..device_patch_manager import device_patch_manager
-
-    if not chip_name or not chip_name.strip():
-        return {
-            "success": False,
-            "input": chip_name,
-            "matched": None,
-            "all_matches": [],
-            "suggestion": "芯片名称不能为空"
-        }
-
-    chip_name = chip_name.strip()
-
-    # 获取最佳匹配（使用设备补丁管理器）
-    match_result = device_patch_manager.match_device_name(chip_name)
-
-    if not match_result:
-        # 获取所有相似的设备
-        all_matches = device_patch_manager.find_similar_devices(chip_name, limit=10)
-        suggestion = device_patch_manager.get_device_name_suggestions(chip_name)
-        logger.warning(f"芯片名称未找到匹配: '{chip_name}'")
-        return {
-            "success": False,
-            "input": chip_name,
-            "matched": None,
-            "all_matches": all_matches,
-            "suggestion": suggestion
-        }
-
-    matched, patch = match_result
-
-    # 获取所有相似的设备
-    all_matches = device_patch_manager.find_similar_devices(chip_name, limit=10)
-
-    logger.info(f"芯片名称匹配成功: '{chip_name}' -> '{matched}' (补丁: {patch.vendor_name})")
-    return {
-        "success": True,
-        "input": chip_name,
-        "matched": matched,
-        "all_matches": all_matches,
-        "suggestion": f"匹配成功: {matched} (补丁: {patch.vendor_name})"
-    }

@@ -5,7 +5,7 @@ from typing import Dict, Any, List, Optional
 from ..jlink_manager import jlink_manager
 from ..exceptions import JLinkMCPError, JLinkErrorCode
 from ..target_access import read_bytes, write_bytes, validate_span, ensure_halted, register_name as normalize_register
-from ..utils import logger, validate_address, format_bytes, parse_hex_string
+from ..utils import logger, format_bytes, parse_hex_string
 
 
 def read_memory(address: int, size: int, width: int = 32) -> Dict[str, Any]:

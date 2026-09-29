@@ -63,20 +63,6 @@ def parse_hex_string(hex_str: str) -> bytes:
         raise ValueError(f"无效的十六进制字符串: {hex_str}") from e
 
 
-def validate_address(address: int, size: int = 4) -> None:
-    """验证地址是否有效.
-
-    Args:
-        address: 内存地址
-        size: 访问大小（字节）
-
-    Raises:
-        ValueError: 如果地址无效
-    """
-    if address < 0:
-        raise ValueError(f"地址不能为负数: {address}")
-    if address % size != 0:
-        raise ValueError(f"地址 {address:#x} 未按 {size} 字节对齐")
 
 
 def human_readable_size(size_bytes: int) -> str:
@@ -98,20 +84,6 @@ def human_readable_size(size_bytes: int) -> str:
         return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
 
-def truncate_string(s: str, max_length: int = 100, suffix: str = "...") -> str:
-    """截断长字符串.
-
-    Args:
-        s: 原始字符串
-        max_length: 最大长度
-        suffix: 截断后添加的后缀
-
-    Returns:
-        截断后的字符串
-    """
-    if len(s) <= max_length:
-        return s
-    return s[:max_length - len(suffix)] + suffix
 
 
 def find_jlink_dll() -> Optional[str]:

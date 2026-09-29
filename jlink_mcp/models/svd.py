@@ -28,6 +28,7 @@ class FieldInfo(BaseModel):
     bit_width: int = Field(..., gt=0, le=32, description="位宽")
     bit_mask: int = Field(0, description="预计算的位掩码，bit_mask = (1 << bit_width) - 1")
     access: Optional[str] = Field(None, description="访问权限")
+    read_action: Optional[str] = Field(None, description="SVD readAction side effect")
     reset_value: Optional[int] = Field(None, description="复位值")
     enumerated_values: List[EnumeratedValue] = Field(default_factory=list, description="枚举值列表")
     # 预计算的枚举字典: {value: (name, description)}，用于 O(1) 查找
@@ -44,6 +45,7 @@ class RegisterInfo(BaseModel):
     address_offset: int = Field(..., description="地址偏移")
     size: int = Field(32, description="寄存器大小（位）")
     access: Optional[str] = Field(None, description="访问权限")
+    read_action: Optional[str] = Field(None, description="SVD readAction side effect")
     reset_value: Optional[int] = Field(None, description="复位值")
     fields: List[FieldInfo] = Field(default_factory=list, description="字段列表")
 

@@ -36,7 +36,7 @@ class SVDManager:
     _initialized: bool = False
 
     # 缓存版本号，当模型结构变化时需要更新
-    CACHE_VERSION = 3
+    CACHE_VERSION = 4
 
     def __new__(cls) -> "SVDManager":
         if cls._instance is None:
@@ -339,6 +339,7 @@ class SVDManager:
             address_offset=self._parse_int(register.findtext("addressOffset", "0")),
             size=self._parse_int(register.findtext("size", "32")),
             access=register.findtext("access"),
+            read_action=register.findtext("readAction"),
             reset_value=self._parse_int(register.findtext("resetValue")),
             fields=fields
         )
@@ -374,6 +375,7 @@ class SVDManager:
             bit_width=bit_width,
             bit_mask=bit_mask,  # 预计算的 mask
             access=field.findtext("access"),
+            read_action=field.findtext("readAction"),
             reset_value=self._parse_int(field.findtext("resetValue")),
             enumerated_values=enumerated_values,
             enum_map=enum_map  # 预计算的枚举字典

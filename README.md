@@ -1,185 +1,188 @@
-# JLink MCP Server
+# J-Link MCP 0.5.1
 
-**AI 与 J-Link 调试器的桥梁 —— 一个 MCP (Model Context Protocol) 服务器**
+面向嵌入式调试任务的 MCP 服务。对外只提供 **10 个工具**；J-Link DLL、ELF 符号解析和 SVD 是内部实现。0.3 是破坏性 API 更新，旧工具名不再注册，迁移见 [迁移说明](docs/MIGRATION.md)。
 
-> 本项目是 [cyj0920/jlink_mcp](https://github.com/cyj0920/jlink_mcp) 的修复分支（fork），
-> 重点修复了与 `pylink-square 2.x` 的 API 不兼容问题，使其可稳定运行于 64 位 Python + 新版 SEGGER J-Link。
+## 安装与启动
 
----
-
-## ✨ 本分支的修复内容
-
-原包 `jlink-mcp 0.1.x` 是基于旧版 pylink API 编写的，而安装的是 `pylink-square 2.0.x`，
-导致连接、复位、寄存器、断点、Flash 等一系列功能无法正常工作。本分支针对性地修复了以下问题：
-
-| 模块 | 原代码（旧 API） | 修复后（pylink-square 2.x） |
-|------|------------------|------------------------------|
-| 连接 | `connect("")` 空串自动检测 / 补丁库未命中即报错 | 芯片名直接穿透给 pylink 原生数据库 + 通用内核名自动检测（Cortex-M4 等） |
-| 复位 | `reset(JLinkFlags.RESET_*)` | `reset(ms=0, halt=...)` |
-| 运行 | `reset(RESET_DO_NOT_STOP_IF_HALTED)` | `restart()` |
-| 暂停 | `halt()` 异步、无等待 | `halt()` + 核实 `halted()`，失败明确返回；不自动复位 |
-| 单步 | `step()` | `step(thumb=True)` |
-| 断点 | `set_breakpoint()` / `clear_breakpoint()` | `breakpoint_set()` / `breakpoint_find()` + `breakpoint_clear()` |
-| 寄存器 | `"R14 (LR)"`（J-Link 实际返回 `"R14"`） | 统一为 `"R14"`，读取前自动暂停 |
-| Flash | `flash_download()` / `erase_range()` | `flash()` / `erase()` |
-| 设备信息 | `device_id()` / `device_name()`（不存在） | `core_id()` / 连接时保存的设备名 |
-| DLL 路径 | 仅搜索 `C:\Program Files\...\JLink_x64.dll` | 支持 `JLINK_LIB_PATH` 环境变量指定任意路径 |
-
----
-
-## 功能特性
-
-- **连接管理**：枚举设备、连接 / 断开、状态查询、芯片名智能匹配
-- **设备信息**：读取目标芯片信息、内核类型、电压
-- **内存操作**：读写内存、读写 CPU 寄存器
-- **Flash 操作**：擦除、烧录、校验
-- **调试控制**：复位、运行 / 暂停、单步、断点
-- **RTT**：实时日志读取 / 写入
-- **SVD**：外设寄存器解析
-- **GDB Server**：启动 / 停止 GDB 调试服务器
-
----
-
-## 安装
-
-```bash
-git clone https://github.com/llm-afk/jlink-mcp.git
-cd jlink-mcp
-pip install -e .
-```
-
-前置条件：已安装 [SEGGER J-Link Software](https://www.segger.com/downloads/jlink/)，
-并确保 `JLink_x64.dll` 可被找到。
-
-### 指定 J-Link DLL 路径（可选）
-
-如果 J-Link 软件安装在非默认位置（例如 `D:\Program Files\SEGGER\JLink_V942`），
-可通过环境变量 `JLINK_LIB_PATH` 指定 DLL 目录或完整路径：
+Python 3.10+，SEGGER J-Link 软件。建议在仓库虚拟环境安装：
 
 ```powershell
-$env:JLINK_LIB_PATH = "D:\Program Files\SEGGER\JLink_V942"
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\python.exe -m jlink_mcp
 ```
 
-或直接指向 DLL 文件：
+若 `py` 不可用，请使用已安装 Python 的绝对路径。MCP 客户端的 `command` 建议使用 `.venv\Scripts\python.exe` 的绝对路径，`args` 为 `["-m", "jlink_mcp"]。
 
-```powershell
-$env:JLINK_LIB_PATH = "D:\Program Files\SEGGER\JLink_V942\JLink_x64.dll"
-```
+可设置 `JLINK_LIB_PATH` 指向 `JLink_x64.dll` 或其目录；`JLINK_SVD_DIR` 指向自定义 SVD 目录。默认打包 GD32C10x、N32H473/474/475 四份 SVD。
 
----
+SDK 固定兼容范围 `mcp>=1.26.0,<2`；MCP 2.x 更改了 FastMCP API。ELF 符号解析使用 pyelftools，不要求 GDB。
 
-## SVD 文件管理
+## 十个接口
 
-项目内置了 `GD32C10x.svd` 以及 `N32H473.svd` / `N32H474.svd` / `N32H475.svd`（均位于 `jlink_mcp/tool/SVD_V1.5.6/`），用于外设寄存器的解析与字段展示。SVD 文件查找规则：
+除 discover 外，各工具参数统一放在 `request` 对象中。操作相关字段由严格的 action/kind 联合模型约束，多余参数被拒绝，不会静默忽略。
 
-1. 优先使用环境变量 `JLINK_SVD_DIR` 指定的目录；
-2. 否则使用包内目录 `jlink_mcp/tool/SVD_V1.5.6/`。
+| 工具 | 操作 |
+|---|---|
+| discover | 枚举探针、可用 SVD、能力边界，不连接目标 |
+| session | open / status / close |
+| read | 批量 memory / register / peripheral / symbol / variable |
+| write | 单次 memory / register / peripheral 写入，可显式校验 |
+| control | halt / resume / reset / step（指令级）/ wait / run_until |
+| breakpoint | set / list / remove，执行断点及读/写/访问观察点 |
+| inspect | symbol / variable / preflight / svd / context / fault |
+| capture | snapshot / diff / sample |
+| firmware | verify_image / program / verify / backup / erase_pages / erase_chip |
+| channel | RTT open / status / read / write / close |
 
-**添加新 MCU 的 SVD**：把 `.svd` 文件放到 `jlink_mcp/tool/SVD_V1.5.6/` 目录下（文件名即设备名，例如 `STM32F407.svd` 对应 `get_svd_peripherals(device_name="STM32F407")`），或设置 `JLINK_SVD_DIR` 指向自定义目录。首次访问时会自动解析并生成 `.svd_cache/` 缓存（已加入 `.gitignore`），缓存可随时删除，会自动重建。
+使用提示是 `debug://guide` 资源，不占工具列表。
 
----
+## 基本流程
 
-## 快速开始
-
-### 1. 直接启动
-
-```bash
-python -m jlink_mcp
-```
-
-### 2. 作为 MCP 服务器接入 Claude Code / 客户端
-
-在 MCP 客户端配置中添加：
+1. `discover()` 得到序列号和精确 SVD 名称。
+2. 调用 `session`：
 
 ```json
-{
-  "mcpServers": {
-    "jlink": {
-      "command": "python",
-      "args": ["-m", "jlink_mcp"],
-      "env": {
-        "JLINK_LIB_PATH": "D:\\Program Files\\SEGGER\\JLink_V942"
-      }
-    }
-  }
-}
+{"request":{"action":"open","chip":"GD32C103CB","serial_number":"实际探针序列号","interface":"SWD","architecture":"cortex-m","svd_device":"GD32C10x"}}
 ```
 
----
+需要符号时同时传入 `elf_path`。返回的 `session_id` 用于后续所有目标操作，重连后旧 ID 失效。仅允许一个活动会话；所有工具共享锁，包含采样和 RTT 等待。
 
-## 使用示例
+3. 运行中读取，不自动暂停：
 
-连接一个 GD32 / STM32 目标（`chip_name` 会直接穿透给 pylink 原生数据库，
-支持 `GD32C103VB`、`STM32F407VG`、`Cortex-M4` 等）：
-
-```
-connect_device(interface="SWD", chip_name="GD32C103VB")
-halt_cpu()
-read_registers()
-read_memory(address=0x08000000, size=256)
-run_cpu()
+```json
+{"request":{"session_id":"返回的ID","consistency":"live","items":[{"kind":"memory","address":536870912,"size":16,"width":32},{"kind":"symbol","name":"g_state"}]}}
 ```
 
----
+`symbol` 只读取 ELF 中有明确地址和大小的对象原始字节；`g_state` 为示意符号，不保证存在于实际固件。需要 DWARF 类型和结构体成员时使用下面的 `variable`。ELF 的 SHA256 仅标识本地文件，初始 `target_match=unknown`；运行 `firmware verify_image` 才生成匹配证据。
 
-## 工具列表
+4. 需要寄存器或单步时，先显式 `control`：
 
-- 连接：`list_jlink_devices` `connect_device` `disconnect_device` `get_connection_status` `match_chip_name`
-- 设备信息：`get_target_info` `get_target_voltage` `scan_target_devices` `list_device_patches`
-- 内存：`read_memory` `write_memory` `read_registers` `write_register`
-- Flash：`erase_flash` `erase_sector` `program_flash` `verify_flash`
-- 调试：`reset_target` `run_cpu` `halt_cpu` `step_instruction` `get_cpu_state` `set_breakpoint` `clear_breakpoint`
-- RTT：`rtt_start` `rtt_read` `rtt_write` `rtt_stop` `rtt_get_status`
-- SVD：`get_svd_peripherals` `get_svd_registers` `parse_register_value` `read_register_with_fields` `read_register_by_address` `write_register_by_address` `list_svd_devices`
-- GDB：`start_gdb_server` `stop_gdb_server` `get_gdb_server_status`
-- 辅助：`get_usage_guidance` `list_scenarios` `get_best_practices` `get_forbidden_operations` `get_system_prompt`
+```json
+{"request":{"session_id":"返回的ID","action":"halt","timeout_ms":1000}}
+```
 
----
+再调用 `read`：
 
-## 注意事项
+```json
+{"request":{"session_id":"返回的ID","consistency":"halted","items":[{"kind":"register","name":"PC"},{"kind":"register","name":"SP"}]}}
+```
 
-- **弹窗**：连接目标后会自动禁用 J-Link 对话框弹窗，擦除 / 烧录时不会再跳出 GUI 窗口。
-- **Flash 整片擦除**：`erase_flash(chip_erase=True)` 擦除的是整颗芯片的 Flash（含 bootloader 与 app），擦除前请确认固件可重新烧录。若只想擦指定扇区（页），用 `erase_sector(address, count, page_size)`（对 J-Link 支持的 Cortex-M 芯片通用，实际擦除粒度由 J-Link 按设备扇区大小决定）。
-- **运行中访问内存 / 寄存器**：内存/SVD 读取不自动暂停；CPU 寄存器读取会确认暂停并保持暂停，检查后用 `run_cpu()` 恢复。
-- **修改源码后**：需重启 MCP server（或重新加载客户端）才会生效。
+`live` 拒绝 CPU 寄存器读取，即使它当前已暂停；`halted` 要求已经暂停。读取过程中观察到 CPU 恢复运行时丢弃该批暂停快照。暂停 CPU 也不保证 DMA/外设静止。
 
-## 常见问题（FAQ）
+5. 使用 `control resume` 恢复；结束调用 `session close`。不会因 close 自动恢复运行。断点只列出和清理本会话设置的断点。
 
-**Q：连接时报「找不到 J-Link DLL」？**
-本工具会自动扫描常见安装路径（含 C / D / E 盘的 `SEGGER` 目录及 `JLink_Vxxx` 版本目录）。若仍找不到，设置 `JLINK_LIB_PATH` 指向 DLL 目录即可（见上文「指定 J-Link DLL 路径」）。
+## 项目配置与带类型的变量读取（0.4）
 
-**Q：`connect_device` 报「无法连接到芯片」？**
-检查：① 目标板已上电；② 接口类型正确（多数 Cortex-M 用 SWD）；③ `chip_name` 拼写正确，或用通用内核名 `Cortex-M4` 自动检测。
+仓库提供 [c1_driver 配置](profiles/c1_driver.json)，包含芯片、SWD、SVD、ELF 路径、Flash/RAM 区域及看门狗调试位检查。相对文件路径以配置所在目录为基准；使用 wheel 安装时需自行保存项目 JSON，仓库示例不会自动安装到用户工程。配置加载不写寄存器；探针序列号由调用者明确指定。芯片和架构不允许与配置冲突。
 
-**Q：读内存 / 寄存器报「目标正在运行」？**
-内存读取不会主动暂停；需要一致快照时先 `halt_cpu()`。CPU 寄存器读取会自动请求暂停并核实，失败不会复位或返回全零假成功。
+```json
+{"request":{"action":"open","profile_path":"C:/Users/32196/Desktop/jlink-mcp/profiles/c1_driver.json","serial_number":"174504233"}}
+{"request":{"session_id":"返回的ID","action":"preflight"}}
+{"request":{"session_id":"返回的ID","action":"verify_image"}}
+```
 
-**Q：`erase_flash` 会把整颗芯片擦掉吗？**
-只有显式 `erase_flash(chip_erase=True)` 才整片擦除。传入范围会报错，不会退化为整片擦除。若只想擦指定扇区（页），用 `erase_sector(address, count, page_size)`（对 J-Link 支持的 Cortex-M 芯片通用，实际擦除粒度由 J-Link 按设备扇区大小决定）。
+后两个请求分别发给 `inspect` 和 `firmware`。`preflight` 只报告配置中的调试寄存器值、掩码和 satisfied；success 表示读取完成，不代表调试条件全部满足，也不自动设置看门狗冻结位。
 
-**Q：改了源码 / SVD 后不生效？**
-重启 MCP server（或重新加载 MCP 客户端）才会加载新代码。
+`verify_image` 按 ELF 的 PT_LOAD 装载地址比较 allocated/read-only PROGBITS，排除可写 RAM 初始化段、NOBITS 和配置的可变参数区。返回 `matched / mismatch / partial / unknown`、比较字节数、各范围 SHA256 和最多 16 个差异地址。只有全部候选只读字节均被覆盖且一致才是 matched；这是指定只读区域的当次证据，不是完整 Flash、DWARF 调试信息或源码构建来源的证明。当前 c1 配置的 EEPROM 117–127 页不参与比较。
 
----
+```json
+{"request":{"session_id":"返回的ID","action":"variable","name":"MotorControl.PID_Iq.kp"}}
+{"request":{"session_id":"返回的ID","consistency":"live","items":[{"kind":"variable","name":"state_mcs"},{"kind":"variable","name":"MotorControl.Iq"},{"kind":"variable","name":"MotorControl"}]}}
+```
 
-## 许可证
+分别发给 `inspect`、`read`。`inspect variable` 只解析地址和类型；`read variable` 默认要求本会话已有 matched 证据。显式 `require_match=false` 可进行不匹配调查，结果仍标记实际 elf_match，不能据此确认变量语义。所有类型读取必须落在配置的 RAM/Flash 内；配置不是通用写入访问控制表。
 
-MIT License，版权归原作者 [cyj0920](https://github.com/cyj0920) 所有。
-本分支在其基础上做了 pylink-square 2.x 兼容性修复，详见 [LICENSE](LICENSE)。
+支持具有固定地址的全局变量、嵌套结构体、连续定长数组、整数、浮点、布尔和枚举。`global.member[index]` 是唯一选择语法；指针只显示地址，不解引用。拒绝局部变量、动态位置、函数调用、位域、联合体、动态/跨步数组等未支持类型。单对象最大 64KB，数组最多 4096 元素，类型深度最多 16，解码值树最多 8192 节点。返回值同时保留原始字节；NaN/Infinity 用字符串表达，保持合法 JSON。
 
+`capture` 直接复用 variable，无新增工具。运行中的多变量或结构体读取不保证一致时刻。显式写入、复位、Flash 修改尝试和连接失效会清除映像匹配证据；外部工具或目标自行改写 Flash 无法自动检测，必要时重新 verify_image。
 
-## 常用操作与行为约定（2026-09 修订）
+## 等待、现场定位和数据观察点（0.5）
 
-- 连接后可直接 `read_memory(0x20000000, 16, width=32)`；读取不打断程序，实时数据不保证是同一时刻的快照。
-- 调试寄存器可用 `read_registers(["PC", "SP", "LR", "R0"])`。目标保持暂停；看门狗导致暂停失败时明确报错，不自动复位。确认允许复位后再调用 `reset_target("halt")`。
-- 内存 `size` 和 hex 数据始终以字节为单位；`width=8/16/32` 真正控制总线访问宽度。地址和长度必须按 width 对齐，任意长度二进制数据使用 `width=8`。
-- 通常直接 `program_flash(address=0x08000000, file_path="firmware.bin", verify=True)`，不需先整片擦除。file_path 为原始 BIN；HEX/ELF/AXF 先转换，data/file_path 二选一。校验或短读失败返回 `success=false`。
-- 只清空某页使用 `erase_sector(address, count, page_size)`，页大小必须符合芯片实际布局。范围形式的 `erase_flash` 已拒绝；只有显式 `chip_erase=True` 且无范围参数才允许整片擦除。
-- RTT：`rtt_start()` → `rtt_read()` / `rtt_write("command\n")` → `rtt_stop()`。默认最多等 1000 ms，`timeout_ms=0` 为立即返回；上限 30000 ms。`read_mode="once"` 每次立即轮询，continuous 等首批数据后返回，不启动后台任务。
-- RTT 支持 `rtt_start(block_address=...)`；省略 read/write 的 buffer_index 会沿用启动时配置。相同配置重复启动、重复停止可直接重试；断连、复位、烧录后须重新 start。
-- RTT 写入自动补发剩余字节；超时返回 `complete=false` 和实际 `bytes_written`，不要重发整条命令。读取保留跨调用 UTF-8 状态，`data_hex` 保留原始字节；空读不等于固件没有 RTT。
-- `start_gdb_server()` 默认使用已连接芯片并限制本机访问，不主动暂停或初始化 CPU 寄存器；需要外部访问时显式 host="0.0.0.0"。只支持 localhost/127.0.0.1/0.0.0.0，收到监听就绪日志后才报启动成功。
+`control wait` 只等待 CPU 停止，最长 30 秒，不继续、不暂停、不复位。返回停止原因（调试请求、代码断点、数据观察点或向量捕获）、原始原因码和 PC/LR/SP/XPSR；原因读取失败会保留错误，不推断原因。
 
-GDB 参数依据：[SEGGER GDB Server 文档](https://kb.segger.com/J-Link_GDB_Server)。修改源码后请重新加载 MCP 服务，新开服务进程才会加载修复。
+`control run_until` 要求已经暂停，接收 address 或函数 symbol，设置临时硬件断点并继续运行。返回 target_reached、already_at_target、stopped_elsewhere 或 timeout。默认 on_timeout=halt；显式 running 则不主动暂停。目标已停在指定地址时不执行任何指令。临时断点在正常返回及异常路径清理，复用用户已有断点时保留；清理失败返回剩余 breakpoint_id。DLL 挂死/进程终止时不能保证清理，仍以 BACKEND_TIMEOUT 的未知完成状态为准。
 
-离线回归：`python -m unittest discover -s tests -v`。硬件测试记录见 `FIX_REPORT_20260929.md`；实板测试必须先备份并在结束后恢复原 Flash。
+```json
+{"request":{"session_id":"返回的ID","action":"run_until","symbol":"servo_loop","timeout_ms":3000,"on_timeout":"halt"}}
+{"request":{"session_id":"返回的ID","action":"context","instructions":8}}
+```
+
+分别发给 control 和 inspect。`context` 要求暂停，给出 PC/LR 对应的 ELF 函数、源码路径/行号，并从目标实际字节反汇编；可选 address 指定反汇编起点，instructions=0 可跳过。最多 32 条，读取限定在项目内存或 ELF 可执行区。源码路径来自 DWARF，不代表源码文件内容已验证；映射始终携带 ELF 匹配状态，不将不匹配映射当成事实。停机原因的 unit_index=-1 表示驱动没有报告单元索引。
+
+```json
+{"request":{"session_id":"返回的ID","action":"set","kind":"write","variable":"MotorControl.BusVoltage"}}
+{"request":{"session_id":"返回的ID","action":"resume"}}
+{"request":{"session_id":"返回的ID","action":"wait","timeout_ms":1000}}
+```
+
+分别发给 breakpoint、control、control。breakpoint 的 kind 支持 execute/read/write/access；execute 为默认值。数据观察点接收 variable 或 address+size；宽度为 1/2/4 字节且要求对齐，匹配对应访问宽度，不解引用指针，也不支持任意值条件。观察点数量取决于硬件资源，分配失败明确返回错误。硬件报告的停止 PC 可能已位于触发访问之后；不能直接把当前行当成写入行。
+
+所有执行断点均使用硬件，不回退软件 Flash 断点。符号执行断点和变量观察点要求本会话有 matched 证据；调查不匹配镜像时可显式使用地址。set/remove 仍要求暂停，reset/close 清理本会话持有的两类断点。resume 后若已经命中断点，返回 observed_halted 和 running_observed=false，避免将快速命中误报为超时。
+
+`inspect fault` 新增具名 CFSR/HFSR 标志和 exception_frame。仅对 ARMv7-M 的有效 EXC_RETURN 解析一层异常帧，支持 MSP/PSP、基本/扩展浮点栈布局和对齐填充，保留核心寄存器原始字节。自动恢复要求停在向量表指向的异常入口；执行过处理函数后 SP 可能已移动，须同时提供明确的 frame_address 和 exc_return。帧必须落在配置 RAM 中；堆栈错误或字段无效时返回 unavailable/invalid。浮点载荷不解码，也不将异常帧冒充完整调用栈。
+
+## 行为约定
+
+- `read` 最多 64 项，合计最多 64KB，逐项结果包含采集时间、原始数据或明确错误。`width=8/16/32` 控制真实访问宽度，大小按字节计。
+- 内存读取不会主动暂停；SVD 读取对已解析的 `readAction` 默认拒绝，需显式 `allow_side_effects=true`。SVD 不是完整访问策略：其继承、厂商扩展及遗漏不能作为无副作用证明。
+- `write` 默认要求暂停，但不主动暂停；默认不读回，`verify=true` 才执行读回。外设读回可能有副作用或因 W1C、自清零、硬件并发变化而不等于写入值。
+- 写入、运行控制等命令遇到异常不自动重试。返回失败时，尤其超时，不能据此推断目标没有发生变化。
+- J-Link DLL 在独立子进程中运行。普通操作最多等待 20 秒，control/channel 至少 10 秒或请求等待时间加 5 秒，firmware 120 秒；超时终止本服务拥有的驱动进程树，返回 BACKEND_TIMEOUT、session_lost=true、completion=unknown。MCP 服务继续存活，必须显式重新打开会话，不能重发未知结果的写入。
+- `control` 返回观测到的运行/暂停状态或 timeout；不会通过自动复位解决暂停失败。`step`、`run_until` 和硬件断点要求明确配置为 Cortex-M 的会话。
+- `inspect fault` 读取并核对 CPUID，当前只支持 Cortex-M3/M4/M7。保留原始证据和逐项错误，不把 sticky fault 位当成当前根因。
+- 每个结果含会话、目标、generation、UTC 时间、耗时、操作前后 CPU 状态。批量读取不是原子快照。
+
+## 快照与有限采样
+
+`capture snapshot` 使用与 `read` 相同的 items/consistency，返回 snapshot_id。`capture diff` 将该快照与现在比较；原快照保持不变。最多保留 16 个，超出淘汰最早项。
+
+`capture sample` 使用相同 items，外加 `count`、`interval_ms`、可选 `output_path`。最多 128 次、1MiB 原始载荷和 10 秒请求窗口；单次底层驱动阻塞可能延长实际时长。默认文件在当前目录 `captures/`，JSONL 含原始结果、会话及主机时间，不覆盖已有文件。主机时间不是 MCU 精确采样时间，不能用于声称验证了高速电流环时序。
+
+复位、固件修改尝试、断开/重连会使旧快照失效。固件修改失败也失效，因为可能已部分写入。
+
+## 固件与 RTT
+
+`verify_image` 可在运行中只读执行；其他 firmware 操作要求先明确暂停。
+
+- program/verify：仅接收原始 `.bin` 和明确地址；最大 16MiB；program 必须读回校验，不预先整片擦除，不自动运行。
+- backup：给出 address、size、output_path，不覆盖；返回文件 SHA256。失败可能留下不完整文件，只有 success=true 才是完整备份；单次读取和文件哈希不等于双读一致验证。
+- erase_pages：必须显式提供页大小，地址必须页对齐；不会向下取整。页大小须与真实芯片匹配，实际擦除仍由 J-Link 算法决定。
+- erase_chip：必须显式 `confirm_chip` 等于会话 chip；包含 bootloader/app，绝不能用于范围擦除的回退。
+- Flash 算法可能改变 CPU 状态，结果报告实际状态；不承诺恢复操作前状态。
+- RTT 沿用部分发送补发和 UTF-8 增量解码；默认读取立即返回，等待最长 30 秒。复位、Flash 修改、断连后重新 open。
+
+## 架构和当前范围
+
+`server.py` 是 MCP 适配层，`api_models.py` 是严格请求模型，`worker.py`/`worker_entry.py` 隔离原生驱动并执行墙钟超时，`service.py` 负责会话/串行执行/证据与任务操作，现有 `tools/` 和 `target_access.py` 提供底层实现，`symbols.py`/`dwarf_variables.py` 提供离线 ELF/DWARF 索引，`source_context.py` 提供源码映射和 Capstone Thumb 反汇编，`fault_context.py` 恢复有限异常栈，`profiles.py` 定义项目配置，`image_match.py` 比对只读映像。
+
+当前不实现 GDB 调用栈、源码单步、完整 DWARF、RISC-V 故障分析、多目标会话。能力列表明确给出这些限制。原 GDB Server 模块保留供后续后端整合，未注册启停 MCP 工具；检测到它占用探针时拒绝 DLL 操作。
+
+## 验证
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+保留全部 114 项回归测试，覆盖严格请求模型、驱动隔离、会话状态、Flash/RTT、DWARF、等待/观察点与异常现场。实板结果和清理说明见 [验证记录](docs/VALIDATION.md)。
+
+只读实板复验（不暂停、不复位、不烧录）：
+
+```powershell
+.\.venv\Scripts\python.exe scripts/validate_readonly.py --serial 174504233
+```
+
+`scripts/validate_debug.py` 用于完整侵入性测试，需要明确传入 `--power-stage-off`，会备份、烧录当前 App 并注入可控故障；见验证记录。
+
+## 目录
+
+- `jlink_mcp/`：运行源码及 4 份 SVD。
+- `tests/`：离线回归测试。
+- `profiles/`：项目配置示例。
+- `scripts/`：只读、完整调试两份实板验证脚本。
+- `docs/`：迁移说明与验证记录。
+- `pyproject.toml`：唯一的依赖和构建声明，安装使用 `pip install -e .`。
+
+`.venv/` 是当前运行环境；`.local/` 保存本地历史归档和新生成的验证数据，均不提交仓库。复制的固件工程、旧审计脚本和重复报告已从工作目录清理，历史恢复材料在 `.local/workspace-before-cleanup-20260929.zip` 中。
+
+MIT，原作者与许可见 LICENSE。

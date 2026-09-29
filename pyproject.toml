@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jlink-mcp"
-version = "0.2.0"
-description = "AI 与 JLink 调试器的桥梁 - MCP 服务器（修复 pylink-square 2.x 兼容性）"
+version = "0.5.1"
+description = "面向嵌入式调试的精简 J-Link MCP 服务"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -14,10 +14,12 @@ authors = [
 ]
 keywords = ["debugger", "embedded", "jlink", "mcp", "mcu", "segger"]
 dependencies = [
-    "mcp>=1.26.0",
+    "mcp>=1.26.0,<2",
     "pydantic>=2.12.0",
-    "pydantic-settings>=2.12.0",
     "pylink-square>=2.0.0",
+    "pyelftools>=0.31",
+    "psutil>=5.9",
+    "capstone>=5.0.3,<6",
 ]
 
 [project.scripts]

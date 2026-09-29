@@ -9,7 +9,7 @@
     >>> info = jlink_manager.get_target_info()
 """
 
-__version__ = "0.2.0"
+__version__ = "0.5.1"
 __author__ = "JLink MCP Team"
 
 from .jlink_manager import JLinkManager, jlink_manager
