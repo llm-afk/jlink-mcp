@@ -149,7 +149,7 @@ class ConfigManager:
 ## 🎯 全局默认配置
 - **默认接口**：SWD（GD32 / STM32 等 Cortex-M 系列最常用，接线少、速度快）
 - **芯片名称**：直接使用芯片型号（如 GD32C103VB、STM32F407VG），或用通用内核名（Cortex-M4 等）自动检测
-- **暂停规则**：读取寄存器 / 内存前先 halt_cpu()，操作完成后按需 run_cpu()
+- **暂停规则**：内存/外设读取保持 CPU 原状态；CPU 寄存器读取确认暂停后才返回，操作完成按需 run_cpu()
 - **SVD 解析**：读取外设寄存器字段用 read_register_with_fields，不必手动查地址
 
 ## ✅ 推荐流程
@@ -160,17 +160,17 @@ class ConfigManager:
 
 ### 读取外设寄存器（带字段解析）
 1. connect_device(...) - 连接
-2. halt_cpu() - 暂停 CPU
+2. 需要一致快照时 halt_cpu()；实时观察可保持运行
 3. get_svd_registers(device, peripheral) - 查寄存器定义（仅一次并缓存）
 4. read_register_with_fields(device, peripheral, register) - 读取并解析字段
 
 ### 内存读写
-1. halt_cpu()
-2. read_memory(address, size) / write_memory(address, data)
+1. read_memory(address, size, width) / write_memory(address, data, width)，size/data 以字节为单位且按 width 对齐
+2. 需要一致快照时先暂停；数据长度任意时用 width=8
 
 ### Flash 操作（整片擦除会清空 bootloader，先确认可重烧）
-1. erase_flash(chip_erase=True) - 擦除
-2. program_flash(address, data, verify=True) - 烧录并校验
+1. program_flash(address, file_path="firmware.bin", verify=True) - 通常直接烧录，无需预擦除
+2. 局部清空用 erase_sector；只有明确需要清空全片时用 erase_flash(chip_erase=True)，不接受范围参数
 
 ## 📍 地址获取规则
 - 已知寄存器地址：直接 read_register_by_address(address)
@@ -179,12 +179,12 @@ class ConfigManager:
 
 ## 📋 错误处理原则
 - 连接失败：检查芯片名、接口类型（SWD/JTAG）、目标是否上电
-- 读取失败：检查是否已 halt_cpu()；目标运行中会自动暂停
-- Flash 失败：先擦除再烧录
+- 读取失败：区分访问宽度/地址错误与 CPU 暂停失败；不会自动复位，看门狗可能影响暂停
+- Flash 失败：检查 success/error/verify_result、镜像格式和装载地址，不能默认整片擦除
 - 始终提供具体诊断与可操作建议
 
 ## 💡 性能与体验
-- 无依赖的工具调用尽量并行
+- 同一探针的硬件操作串行执行；纯 SVD 查询可以独立进行
 - 缓存查询结果（外设 / 寄存器 / 地址）
 - 只读取必要数据，减少传输
 - 使用 get_usage_guidance() / get_best_practices() 获取最佳实践

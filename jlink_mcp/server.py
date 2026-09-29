@@ -218,11 +218,11 @@ async def list_device_patches() -> dict:
 
 @mcp.tool()
 async def read_memory(address: int, size: int, width: int = 32) -> dict:
-    """读取指定地址的内存.
+    """读取内存，不主动暂停 CPU；一致快照请先 halt_cpu.
 
     Args:
         address: 起始地址
-        size: 读取大小（字节，最大 64KB）
+        size: 读取大小（字节，最大 64KB，须按 width 对齐）
         width: 访问宽度（8/16/32位，默认 32）
 
     Returns:
@@ -248,7 +248,7 @@ async def write_memory(address: int, data: str, width: int = 32) -> dict:
 
 @mcp.tool()
 async def read_registers(register_names: list[str] | None = None) -> dict:
-    """读取 CPU 寄存器.
+    """确认暂停后读取 CPU 寄存器并保持暂停；支持 PC/SP/LR 别名.
 
     Args:
         register_names: 寄存器名称列表（可选，None 则读取所有通用寄存器）
@@ -432,19 +432,21 @@ async def clear_breakpoint(address: int) -> dict:
 async def rtt_start(
     buffer_index: int = 0,
     read_mode: str = "continuous",
-    timeout_ms: int = 1000
+    timeout_ms: int = 1000,
+    block_address: int | None = None
 ) -> dict:
     """启动 RTT.
 
     Args:
         buffer_index: RTT 缓冲区索引
-        read_mode: 读取模式
-        timeout_ms: 超时时间（毫秒）
+        read_mode: continuous 等待首批数据；once 立即轮询
+        timeout_ms: 默认读写等待时间（0–30000 毫秒）
+        block_address: 可选 RTT 控制块地址，已知时可避免搜索
 
     Returns:
         启动结果
     """
-    return _rtt_start(buffer_index, read_mode, timeout_ms)
+    return _rtt_start(buffer_index, read_mode, timeout_ms, block_address)
 
 
 @mcp.tool()
@@ -459,7 +461,7 @@ async def rtt_stop() -> dict:
 
 @mcp.tool()
 async def rtt_read(
-    buffer_index: int = 0,
+    buffer_index: int | None = None,
     size: int = 1024,
     timeout_ms: int | None = None
 ) -> dict:
@@ -477,7 +479,7 @@ async def rtt_read(
 
 
 @mcp.tool()
-async def rtt_write(data: str, buffer_index: int = 0) -> dict:
+async def rtt_write(data: str, buffer_index: int | None = None, timeout_ms: int | None = None) -> dict:
     """向 RTT 写入数据.
 
     Args:
@@ -487,7 +489,7 @@ async def rtt_write(data: str, buffer_index: int = 0) -> dict:
     Returns:
         写入结果
     """
-    return _rtt_write(data, buffer_index)
+    return _rtt_write(data, buffer_index, timeout_ms)
 
 
 @mcp.tool()
@@ -506,7 +508,7 @@ async def rtt_get_status() -> dict:
 
 @mcp.tool()
 async def start_gdb_server(
-    host: str = "0.0.0.0",
+    host: str = "127.0.0.1",
     port: int = 2331,
     device: str | None = None,
     interface: str = "SWD",

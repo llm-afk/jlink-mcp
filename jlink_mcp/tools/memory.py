@@ -1,11 +1,10 @@
 """内存操作工具函数."""
 
-import time
 from typing import Dict, Any, List, Optional
 
 from ..jlink_manager import jlink_manager
 from ..exceptions import JLinkMCPError, JLinkErrorCode
-from ..models.operations import MemoryReadRequest, MemoryWriteRequest, RegisterReadResult
+from ..target_access import read_bytes, write_bytes, validate_span, ensure_halted, register_name as normalize_register
 from ..utils import logger, validate_address, format_bytes, parse_hex_string
 
 
@@ -33,20 +32,9 @@ def read_memory(address: int, size: int, width: int = 32) -> Dict[str, Any]:
         if width not in (8, 16, 32):
             raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, f"宽度必须是 8/16/32: {width}")
 
-        validate_address(address, width // 8)
-
+        validate_span(address, size, width)
         jlink = jlink_manager.get_jlink()
-        
-        # 添加：检查目标是否暂停（解决 -3 错误的主要原因）
-        try:
-            if hasattr(jlink, 'halted') and not jlink.halted():
-                logger.warning(f"目标正在运行，尝试暂停后读取内存 {address:#x}")
-                jlink.halt()
-        except Exception:
-            # 如果无法检查或暂停状态，继续尝试读取
-            pass
-        
-        data = jlink.memory_read(address, size)
+        data = read_bytes(jlink, address, size, width)
 
         hex_dump = format_bytes(data)
         logger.info(f"读取内存 {address:#x} 大小 {size} 字节成功")
@@ -115,10 +103,9 @@ def write_memory(address: int, data: str, width: int = 32) -> Dict[str, Any]:
 
         data_bytes = parse_hex_string(data)
 
-        validate_address(address, width // 8)
-
+        validate_span(address, len(data_bytes), width)
         jlink = jlink_manager.get_jlink()
-        jlink.memory_write(address, data_bytes)
+        write_bytes(jlink, address, data_bytes, width)
 
         logger.info(f"写入内存 {address:#x} 大小 {len(data_bytes)} 字节成功")
 
@@ -161,45 +148,22 @@ def read_registers(register_names: Optional[List[str]] = None) -> Dict[str, Any]
     try:
         jlink = jlink_manager.get_jlink()
 
-        # 寄存器只能在目标暂停时读取，若在运行则先暂停
-        try:
-            if not jlink.halted():
-                logger.warning("目标正在运行，暂停后读取寄存器")
-                jlink.halt()
-                time.sleep(0.05)
-        except Exception:
-            pass
+        ensure_halted(jlink)
+        names = register_names or [f"R{i}" for i in range(13)] + ["R13 (SP)", "R14", "R15 (PC)", "XPSR", "MSP", "PSP"]
+        registers, errors = [], []
+        for name in names:
+            try:
+                value = jlink.register_read(normalize_register(name))
+                registers.append({"name": name, "value": value & 0xFFFFFFFF})
+            except Exception as exc:
+                errors.append({"name": name, "description": str(exc)})
+        if not jlink.halted():
+            raise JLinkMCPError(JLinkErrorCode.HALT_FAILED, "读取期间目标恢复运行，寄存器快照已丢弃")
+        result = {"success": not errors and bool(registers), "registers": registers, "halted": True, "errors": errors}
+        if not result["success"]:
+            result["error"] = JLinkMCPError(JLinkErrorCode.READ_FAILED, "部分或全部寄存器不可读，详见 errors").to_dict()
+        return result
 
-        if register_names:
-            # 读取指定寄存器
-            registers = []
-            for name in register_names:
-                try:
-                    value = jlink.register_read(name)
-                    registers.append({"name": name, "value": value & 0xFFFFFFFF if isinstance(value, int) else value})
-                except Exception as e:
-                    logger.warning(f"读取寄存器 {name} 失败: {e}")
-        else:
-            # 读取所有通用寄存器（ARM Cortex-M）
-            register_list = [
-                "R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7",
-                "R8", "R9", "R10", "R11", "R12",
-                "R13 (SP)", "R14", "R15 (PC)",
-                "XPSR", "MSP", "PSP"
-            ]
-            registers = []
-            for name in register_list:
-                try:
-                    value = jlink.register_read(name)
-                    registers.append({"name": name, "value": value & 0xFFFFFFFF if isinstance(value, int) else value})
-                except Exception as e:
-                    logger.debug(f"寄存器 {name} 不可用: {e}")
-
-        logger.info(f"读取 {len(registers)} 个寄存器成功")
-        return {
-            "success": True,
-            "registers": registers
-        }
     except JLinkMCPError as e:
         logger.error(f"读取寄存器失败: {e}")
         return {
@@ -238,7 +202,10 @@ def write_register(register_name: str, value: int) -> Dict[str, Any]:
             raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, "寄存器名称不能为空")
 
         jlink = jlink_manager.get_jlink()
-        jlink.register_write(register_name, value)
+        if not 0 <= value <= 0xFFFFFFFF:
+            raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, "寄存器值必须为无符号 32 位")
+        ensure_halted(jlink)
+        jlink.register_write(normalize_register(register_name), value)
 
         logger.info(f"写入寄存器 {register_name} = {value:#x} 成功")
 

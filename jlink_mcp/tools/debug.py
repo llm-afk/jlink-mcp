@@ -7,6 +7,7 @@ from ..jlink_manager import jlink_manager
 from ..exceptions import JLinkMCPError, JLinkErrorCode
 from ..models.operations import DebugBreakpoint, CPUState
 from ..utils import logger
+from ..target_access import ensure_halted
 
 
 def _u32(value):
@@ -30,7 +31,11 @@ def reset_target(reset_type: str = "normal") -> Dict[str, Any]:
         - message: 状态信息
     """
     try:
+        if reset_type not in ("normal", "halt", "core"):
+            raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, "reset_type 必须为 normal/halt/core")
         jlink = jlink_manager.get_jlink()
+        from .rtt import reset_rtt_state
+        reset_rtt_state(jlink)
 
         if reset_type == "halt":
             logger.info("执行复位并暂停")
@@ -38,12 +43,13 @@ def reset_target(reset_type: str = "normal") -> Dict[str, Any]:
         elif reset_type == "core":
             # 内核复位：仅复位内核，不拉硬件复位引脚（外设状态保留）
             logger.info("执行内核复位")
+            import pylink
+            previous = jlink.set_reset_strategy(pylink.JLinkResetStrategyCortexM3.CORE)
             try:
-                import pylink
-                jlink.set_reset_strategy(pylink.JLinkResetStrategyCortexM3.CORE)
-            except Exception as e:
-                logger.warning(f"设置内核复位策略失败（回退普通复位并暂停）: {e}")
-            jlink.reset(ms=0, halt=True)
+                jlink.reset(ms=0, halt=True)
+            finally:
+                jlink.set_reset_strategy(previous)
+
         else:  # normal
             logger.info("执行普通复位")
             jlink.reset(ms=0, halt=False)
@@ -85,27 +91,7 @@ def halt_cpu() -> Dict[str, Any]:
     try:
         jlink = jlink_manager.get_jlink()
 
-        # halt() 是同步的（pylink 的 async_decorator 仅在传入 callback 时才异步），
-        # 成功时内部会 sleep 1s 等待目标真正停止
-        jlink.halt()
-
-        # 以 halted() 为准轮询确认目标已停止（halt() 返回值在某些 DLL/固件下不可靠）
-        halted = False
-        for _ in range(200):  # 最长等待约 1s
-            if jlink.halted():
-                halted = True
-                break
-            time.sleep(0.005)
-
-        if not halted:
-            # 目标未能在预期时间内停止。绝不能在此处 reset 兜底 ——
-            # reset 会破坏正在运行的程序状态，并把 PC 重置到复位向量，
-            # 导致 "暂停" 被误执行为 "复位"。
-            raise JLinkMCPError(
-                JLinkErrorCode.HALT_FAILED,
-                "目标未能在预期时间内停止，可能处于低功耗模式，或固件使能了"
-                "调试期间不停计的看门狗（复位循环）"
-            )
+        ensure_halted(jlink)
 
         pc = _u32(jlink.register_read("R15 (PC)"))
         logger.info(f"CPU 已暂停，PC = {pc:#x}")
@@ -188,7 +174,10 @@ def step_instruction() -> Dict[str, Any]:
     """
     try:
         jlink = jlink_manager.get_jlink()
+        if not jlink.halted():
+            raise JLinkMCPError(JLinkErrorCode.TARGET_RUNNING)
         jlink.step(thumb=True)
+        ensure_halted(jlink)
 
         pc = _u32(jlink.register_read("R15 (PC)"))
         logger.info(f"单步执行，PC = {pc:#x}")

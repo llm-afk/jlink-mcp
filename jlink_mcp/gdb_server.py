@@ -3,6 +3,7 @@
 import subprocess
 import threading
 import time
+from collections import deque
 from typing import Optional, Dict, Any
 
 import pylink
@@ -34,7 +35,9 @@ class GDBServerManager:
 
         self._process: Optional[subprocess.Popen] = None
         self._running: bool = False
-        self._host: str = "0.0.0.0"
+        self._host: str = "127.0.0.1"
+        self._logs = deque(maxlen=80)
+        self._readers = []
         self._port: int = 2331
         self._device: Optional[str] = None
         self._interface: TargetInterface = TargetInterface.SWD
@@ -58,7 +61,7 @@ class GDBServerManager:
 
     def start(
         self,
-        host: str = "0.0.0.0",
+        host: str = "127.0.0.1",
         port: int = 2331,
         device: Optional[str] = None,
         interface: TargetInterface = TargetInterface.SWD,
@@ -68,7 +71,7 @@ class GDBServerManager:
         """启动 GDB Server.
 
         Args:
-            host: 监听地址（默认 0.0.0.0）
+            host: 监听地址（默认 127.0.0.1，仅支持本机或 0.0.0.0）
             port: 监听端口（默认 2331）
             device: 设备名称（None 则使用当前连接的设备）
             interface: 接口类型（默认 SWD）
@@ -95,7 +98,14 @@ class GDBServerManager:
             )
 
         try:
-            import subprocess
+            if host not in ("localhost", "127.0.0.1", "0.0.0.0"):
+                raise GDBServerError(JLinkErrorCode.INVALID_PARAMETER, "host 仅支持 127.0.0.1/localhost 或 0.0.0.0")
+            if not 1 <= port <= 65535 or speed <= 0:
+                raise GDBServerError(JLinkErrorCode.INVALID_PARAMETER, "port 必须为 1–65535，speed 必须大于 0")
+            device = device or jlink_manager._device_name
+            if not device:
+                raise GDBServerError(JLinkErrorCode.INVALID_PARAMETER, "请指定 device 或先连接目标芯片")
+            host = "127.0.0.1" if host == "localhost" else host
 
             self._host = host
             self._port = port
@@ -113,10 +123,12 @@ class GDBServerManager:
 
             cmd = [
                 jlink_exe,
-                "-device", device or "",
+                "-device", device,
                 "-if", interface.value.lower(),
                 "-speed", str(speed),
-                "-port", str(port)
+                "-port", str(port),
+                "-LocalhostOnly", "0" if host == "0.0.0.0" else "1",
+                "-nohalt", "-noir"
             ]
 
             # 如果指定了序列号，添加序列号参数
@@ -131,20 +143,29 @@ class GDBServerManager:
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
             )
 
-            # 等待进程启动
-            time.sleep(0.5)
-
+            # Drain both pipes continuously: a long debug session must not fill a pipe.
+            self._logs.clear()
+            ready = threading.Event()
+            def drain(stream):
+                for raw in iter(stream.readline, b""):
+                    line = raw.decode('utf-8', errors='replace').strip()
+                    self._logs.append(line)
+                    if f"Listening on TCP/IP port {port}" in line:
+                        ready.set()
+            self._readers = [threading.Thread(target=drain, args=(stream,), daemon=True)
+                             for stream in (self._process.stdout, self._process.stderr)]
+            for reader in self._readers:
+                reader.start()
+            deadline = time.monotonic() + 10
+            while not ready.wait(0.05):
+                if self._process.poll() is not None or time.monotonic() >= deadline:
+                    raise GDBServerError(JLinkErrorCode.GDB_SERVER_START_FAILED,
+                                         "GDB 未就绪: " + "\n".join(self._logs))
             if self._process.poll() is not None:
-                stdout, stderr = self._process.communicate()
-                error_msg = stderr.decode('utf-8', errors='ignore') or stdout.decode('utf-8', errors='ignore')
-                raise GDBServerError(
-                    JLinkErrorCode.GDB_SERVER_START_FAILED,
-                    f"GDB Server 启动失败: {error_msg}",
-                    "请检查端口是否被占用，或查看 JLink 日志"
-                )
+                raise GDBServerError(JLinkErrorCode.GDB_SERVER_START_FAILED, "GDB 在就绪后退出")
 
             self._running = True
             logger.info(f"GDB Server 已启动，监听 {host}:{port}")
@@ -184,6 +205,12 @@ class GDBServerManager:
             except Exception as e:
                 logger.warning(f"清理 GDB Server 进程时出错: {e}")
             finally:
+                for reader in self._readers:
+                    reader.join(timeout=0.5)
+                for stream in (self._process.stdout, self._process.stderr):
+                    if stream:
+                        stream.close()
+                self._readers = []
                 self._process = None
 
         self._running = False
@@ -341,7 +368,7 @@ gdb_server_manager = GDBServerManager()
 
 
 def start_gdb_server(
-    host: str = "0.0.0.0",
+    host: str = "127.0.0.1",
     port: int = 2331,
     device: Optional[str] = None,
     interface: str = "SWD",
@@ -351,7 +378,7 @@ def start_gdb_server(
     """启动 GDB Server.
 
     Args:
-        host: 监听地址（默认 0.0.0.0）
+        host: 监听地址（默认 127.0.0.1，仅支持本机或 0.0.0.0）
         port: 监听端口（默认 2331）
         device: 设备名称（None 则使用当前连接的设备）
         interface: 接口类型（SWD/JTAG，默认 SWD）

@@ -276,8 +276,7 @@ class JLinkManager:
     def disconnect(self) -> None:
         """断开 JLink 连接."""
         if not self.is_connected:
-            logger.debug("没有活动的连接")
-            return
+            logger.debug("没有活动连接，仍清理旧会话状态")
 
         logger.info("正在断开连接")
         self._cleanup()
@@ -285,6 +284,8 @@ class JLinkManager:
 
     def _cleanup(self) -> None:
         """清理资源."""
+        from .tools.rtt import reset_rtt_state
+        reset_rtt_state(self._jlink)
         if self._jlink:
             try:
                 self._jlink.close()
@@ -296,6 +297,7 @@ class JLinkManager:
         self._connected = False
         self._device_serial = None
         self._target_connected = False
+        self._device_name = None
 
     def get_connection_status(self) -> ConnectionStatus:
         """获取连接状态.

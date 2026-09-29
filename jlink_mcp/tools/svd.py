@@ -7,6 +7,7 @@ from typing import Dict, Any
 
 from ..svd_manager import svd_manager
 from ..jlink_manager import jlink_manager
+from ..target_access import read_bytes, write_bytes
 from ..exceptions import JLinkMCPError, JLinkErrorCode
 from ..utils import logger
 
@@ -238,7 +239,7 @@ def read_register_with_fields(
 
         # 从目标设备读取寄存器值
         jlink = jlink_manager.get_jlink()
-        data = jlink.memory_read(absolute_address, 4)  # 读取 4 字节
+        data = read_bytes(jlink, absolute_address, register.size // 8, register.size)
         raw_value = int.from_bytes(data, byteorder='little')
 
         # 解析字段（使用预计算的 bit_mask，兼容未计算的情况）
@@ -414,15 +415,7 @@ def read_register_by_address(
 
         jlink = jlink_manager.get_jlink()
 
-        # 目标运行中时先暂停，避免 -3 读取失败
-        try:
-            if hasattr(jlink, 'halted') and not jlink.halted():
-                logger.warning(f"目标正在运行，暂停后读取地址 {address:#x}")
-                jlink.halt()
-        except Exception:
-            pass
-
-        data = jlink.memory_read(address, num_bytes)
+        data = read_bytes(jlink, address, num_bytes, width)
         raw_value = int.from_bytes(data, byteorder='little')
 
         result = {
@@ -508,7 +501,7 @@ def write_register_by_address(
         data = value.to_bytes(num_bytes, byteorder='little')
 
         jlink = jlink_manager.get_jlink()
-        jlink.memory_write(address, data)
+        write_bytes(jlink, address, data, width)
 
         logger.info(f"按地址写入寄存器 {address:#x} = {value:#x}")
 

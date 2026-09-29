@@ -17,7 +17,7 @@
 | 连接 | `connect("")` 空串自动检测 / 补丁库未命中即报错 | 芯片名直接穿透给 pylink 原生数据库 + 通用内核名自动检测（Cortex-M4 等） |
 | 复位 | `reset(JLinkFlags.RESET_*)` | `reset(ms=0, halt=...)` |
 | 运行 | `reset(RESET_DO_NOT_STOP_IF_HALTED)` | `restart()` |
-| 暂停 | `halt()` 异步、无等待 | `halt()` + 轮询 `halted()` + `reset(halt=True)` 兜底 |
+| 暂停 | `halt()` 异步、无等待 | `halt()` + 核实 `halted()`，失败明确返回；不自动复位 |
 | 单步 | `step()` | `step(thumb=True)` |
 | 断点 | `set_breakpoint()` / `clear_breakpoint()` | `breakpoint_set()` / `breakpoint_find()` + `breakpoint_clear()` |
 | 寄存器 | `"R14 (LR)"`（J-Link 实际返回 `"R14"`） | 统一为 `"R14"`，读取前自动暂停 |
@@ -139,8 +139,8 @@ run_cpu()
 ## 注意事项
 
 - **弹窗**：连接目标后会自动禁用 J-Link 对话框弹窗，擦除 / 烧录时不会再跳出 GUI 窗口。
-- **Flash 整片擦除**：`erase_flash()` 擦除的是整颗芯片的 Flash（含 bootloader 与 app），擦除前请确认固件可重新烧录。若只想擦指定扇区（页），用 `erase_sector(address, count, page_size)`（对 J-Link 支持的 Cortex-M 芯片通用，实际擦除粒度由 J-Link 按设备扇区大小决定）。
-- **运行中访问内存 / 寄存器**：目标运行时读取内存或寄存器会自动暂停目标，操作后需调用 `run_cpu()` 恢复。
+- **Flash 整片擦除**：`erase_flash(chip_erase=True)` 擦除的是整颗芯片的 Flash（含 bootloader 与 app），擦除前请确认固件可重新烧录。若只想擦指定扇区（页），用 `erase_sector(address, count, page_size)`（对 J-Link 支持的 Cortex-M 芯片通用，实际擦除粒度由 J-Link 按设备扇区大小决定）。
+- **运行中访问内存 / 寄存器**：内存/SVD 读取不自动暂停；CPU 寄存器读取会确认暂停并保持暂停，检查后用 `run_cpu()` 恢复。
 - **修改源码后**：需重启 MCP server（或重新加载客户端）才会生效。
 
 ## 常见问题（FAQ）
@@ -152,10 +152,10 @@ run_cpu()
 检查：① 目标板已上电；② 接口类型正确（多数 Cortex-M 用 SWD）；③ `chip_name` 拼写正确，或用通用内核名 `Cortex-M4` 自动检测。
 
 **Q：读内存 / 寄存器报「目标正在运行」？**
-先调用 `halt_cpu()` 暂停目标；工具在读取时通常会自动暂停，读完后按需 `run_cpu()`。
+内存读取不会主动暂停；需要一致快照时先 `halt_cpu()`。CPU 寄存器读取会自动请求暂停并核实，失败不会复位或返回全零假成功。
 
 **Q：`erase_flash` 会把整颗芯片擦掉吗？**
-会。pylink 的擦除是整片擦除，bootloader 与 app 一并清空，擦除前请确认固件可重新烧录。若只想擦指定扇区（页），用 `erase_sector(address, count, page_size)`（对 J-Link 支持的 Cortex-M 芯片通用，实际擦除粒度由 J-Link 按设备扇区大小决定）。
+只有显式 `erase_flash(chip_erase=True)` 才整片擦除。传入范围会报错，不会退化为整片擦除。若只想擦指定扇区（页），用 `erase_sector(address, count, page_size)`（对 J-Link 支持的 Cortex-M 芯片通用，实际擦除粒度由 J-Link 按设备扇区大小决定）。
 
 **Q：改了源码 / SVD 后不生效？**
 重启 MCP server（或重新加载 MCP 客户端）才会加载新代码。
@@ -166,3 +166,20 @@ run_cpu()
 
 MIT License，版权归原作者 [cyj0920](https://github.com/cyj0920) 所有。
 本分支在其基础上做了 pylink-square 2.x 兼容性修复，详见 [LICENSE](LICENSE)。
+
+
+## 常用操作与行为约定（2026-09 修订）
+
+- 连接后可直接 `read_memory(0x20000000, 16, width=32)`；读取不打断程序，实时数据不保证是同一时刻的快照。
+- 调试寄存器可用 `read_registers(["PC", "SP", "LR", "R0"])`。目标保持暂停；看门狗导致暂停失败时明确报错，不自动复位。确认允许复位后再调用 `reset_target("halt")`。
+- 内存 `size` 和 hex 数据始终以字节为单位；`width=8/16/32` 真正控制总线访问宽度。地址和长度必须按 width 对齐，任意长度二进制数据使用 `width=8`。
+- 通常直接 `program_flash(address=0x08000000, file_path="firmware.bin", verify=True)`，不需先整片擦除。file_path 为原始 BIN；HEX/ELF/AXF 先转换，data/file_path 二选一。校验或短读失败返回 `success=false`。
+- 只清空某页使用 `erase_sector(address, count, page_size)`，页大小必须符合芯片实际布局。范围形式的 `erase_flash` 已拒绝；只有显式 `chip_erase=True` 且无范围参数才允许整片擦除。
+- RTT：`rtt_start()` → `rtt_read()` / `rtt_write("command\n")` → `rtt_stop()`。默认最多等 1000 ms，`timeout_ms=0` 为立即返回；上限 30000 ms。`read_mode="once"` 每次立即轮询，continuous 等首批数据后返回，不启动后台任务。
+- RTT 支持 `rtt_start(block_address=...)`；省略 read/write 的 buffer_index 会沿用启动时配置。相同配置重复启动、重复停止可直接重试；断连、复位、烧录后须重新 start。
+- RTT 写入自动补发剩余字节；超时返回 `complete=false` 和实际 `bytes_written`，不要重发整条命令。读取保留跨调用 UTF-8 状态，`data_hex` 保留原始字节；空读不等于固件没有 RTT。
+- `start_gdb_server()` 默认使用已连接芯片并限制本机访问，不主动暂停或初始化 CPU 寄存器；需要外部访问时显式 host="0.0.0.0"。只支持 localhost/127.0.0.1/0.0.0.0，收到监听就绪日志后才报启动成功。
+
+GDB 参数依据：[SEGGER GDB Server 文档](https://kb.segger.com/J-Link_GDB_Server)。修改源码后请重新加载 MCP 服务，新开服务进程才会加载修复。
+
+离线回归：`python -m unittest discover -s tests -v`。硬件测试记录见 `FIX_REPORT_20260929.md`；实板测试必须先备份并在结束后恢复原 Flash。

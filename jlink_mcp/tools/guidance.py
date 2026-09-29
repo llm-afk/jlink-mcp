@@ -121,16 +121,16 @@ USAGE_SCENARIOS = {
         "description": "读取指定寄存器的值并解析字段",
         "steps": [
             "1. connect_device(chip_name='GD32C103VB', interface='SWD') - 连接设备",
-            "2. halt_cpu() - 暂停 CPU（必需！否则读取会失败）",
+            "2. 若需要一致快照，先 halt_cpu；普通外设读取可以保持运行",
             "3. read_register_with_fields(device_name, peripheral_name, register_name) - 读取寄存器"
         ],
         "example": "read_register_with_fields('GD32C10x', 'GPIOA', 'CTL0')",
-        "note": "读取寄存器前必须暂停 CPU（halt_cpu），这是成功读取的关键",
+        "note": "CPU 寄存器需要暂停；SVD 外设读取不主动暂停目标",
         "forbidden": [
             "不要调用 get_svd_peripherals() 遍历外设",
             "不要调用 get_svd_registers() 获取寄存器列表（除非未知地址）",
-            "不要读取源代码文件",
-            "不要跳过 halt_cpu() 步骤（读取会失败）"
+            "可结合用户源码核对地址和用途",
+            "不要对读清零/FIFO 等寄存器盲目重复读取"
         ],
         "expected_time": "2-5 秒"
     },
@@ -150,7 +150,7 @@ USAGE_SCENARIOS = {
         "steps": [
             "1. connect_device(chip_name, interface='SWD') - 连接设备",
             "2. get_connection_status() - 确认连接",
-            "3. erase_flash(start_address, end_address) - 擦除指定区域",
+            "3. program_flash 会处理目标扇区；仅需清空页面时使用 erase_sector(address, count, page_size)",
             "4. program_flash(address, data, verify=True) - 烧录并校验",
             "5. verify_flash(address, data) - 再次校验（可选）"
         ],
@@ -207,24 +207,24 @@ BEST_PRACTICES = {
         "title": "读取寄存器最佳实践",
         "recommended_flow": [
             "1. connect_device(chip_name='GD32C103VB', interface='SWD') - 连接设备",
-            "2. halt_cpu() - 暂停 CPU（必需！）",
+            "2. 需要一致快照时 halt_cpu；实时外设读取可保持运行",
             "3. read_register_with_fields(device_name, peripheral_name, register_name) - 直接读取寄存器"
         ],
         "forbidden": [
-            "禁止使用 read_file 工具读取源代码",
+            "优先结合 SVD 与用户源码核对寄存器地址和副作用",
             "禁止调用 get_svd_peripherals() 遍历所有外设",
             "禁止重复调用 get_svd_registers() 获取相同的寄存器列表",
-            "禁止跳过 halt_cpu() 步骤（读取会失败）"
+            "CPU 寄存器读取必须确认暂停；普通外设读取不主动暂停"
         ],
         "performance_tips": [
-            "使用并行调用提高效率（如同时读取多个寄存器）",
+            "同一探针操作串行执行；需要多个 CPU 寄存器时用 read_registers 批量读取",
             "缓存外设和寄存器信息，避免重复查询",
             "最小化数据传输，只读取必要的字段",
             "使用芯片名称（如 GD32C103VB、STM32F407VG）"
         ],
         "common_mistakes": [
-            "❌ 跳过 halt_cpu() 步骤（读取会失败）",
-            "✅ 始终在读取前暂停 CPU（halt_cpu）",
+            "❌ 混淆 CPU 寄存器与内存映射外设寄存器",
+            "✅ CPU 寄存器须稳定暂停，实时外设观察保持运行",
             "❌ 混淆 SVD 设备名与芯片名（SVD 用 'GD32C10x'，芯片名用 'GD32C103VB'）",
             "✅ 用 list_svd_devices() 查看可用 SVD 设备名",
             "❌ 调用 get_svd_peripherals() → get_svd_registers() → read_register_with_fields()（太慢）",
@@ -265,13 +265,13 @@ BEST_PRACTICES = {
     "memory_operations": {
         "title": "内存操作最佳实践",
         "recommended_flow": [
-            "读写内存前，确保 CPU 已暂停（halt_cpu()）",
+            "内存读写保持 CPU 原状态；需要一致快照时先显式暂停",
             "验证地址范围是否有效",
             "选择合适的访问宽度（8/16/32 位）",
-            "读写完成后，恢复 CPU 运行（run_cpu()）"
+            "仅在本次主动暂停且需要恢复时调用 run_cpu()"
         ],
         "forbidden": [
-            "禁止在目标运行时读取内存（可能导致错误）",
+            "不要把运行中变化的数据当作一致快照",
             "禁止写入只读内存区域"
         ],
         "performance_tips": [
@@ -323,23 +323,23 @@ BEST_PRACTICES = {
         "recommended_flow": [
             "1. connect_device(chip_name, interface) - 连接设备",
             "2. halt_cpu() - 暂停 CPU（Flash 操作前建议暂停）",
-            "3. erase_flash(chip_erase=True) - 整片擦除（或指定范围）",
+            "3. 通常无需预擦除；仅明确清空全片时 erase_flash(chip_erase=True)",
             "4. program_flash(address, data, verify=True) - 烧录固件",
             "5. verify_flash(address, data) - 校验烧录结果（可选）"
         ],
         "forbidden": [
-            "禁止在未擦除的情况下向已写入区域重复烧录（Flash 只能 1→0）",
+            "不要用 write_memory 代替 program_flash 烧录 Flash",
             "禁止烧录到非 Flash 地址（如 RAM/外设区）",
             "禁止在烧录失败后直接运行 CPU（先确认烧录完整性）"
         ],
         "performance_tips": [
-            "使用 file_path 参数从 .bin/.hex 文件烧录，避免传输超大数据",
+            "使用 file_path 从原始 .bin 烧录；HEX/ELF 须先转换并核对装载地址",
             "烧录大固件时关闭 verify 可提速（烧录后再单独校验一次）",
-            "整片擦除比多次分扇区擦除更快"
+            "避免无必要的整片擦除，以保留其他镜像和参数"
         ],
         "common_mistakes": [
-            "❌ 忘记先擦除就烧录（写非 0xFF 区域会失败）",
-            "✅ 先 erase_flash 再 program_flash",
+            "❌ 把范围擦除误当整片擦除或将 HEX/ELF 当原始 BIN",
+            "✅ 通常直接 program_flash(..., verify=True)，检查 success 和 verify_result",
             "❌ 烧录后未校验就复位运行",
             "✅ 使用 verify=True 或单独调用 verify_flash"
         ]
@@ -559,12 +559,12 @@ def get_forbidden_operations() -> Dict[str, Any]:
             "不要在已知地址的情况下重复调用 get_svd_registers() 获取寄存器列表"
         ],
         "flash": [
-            "不要在未擦除的情况下向已写入区域重复烧录（Flash 只能 1→0）",
+            "不要用 write_memory 代替 program_flash 烧录 Flash",
             "不要烧录到非 Flash 地址（如 RAM / 外设区）",
             "不要在烧录失败后直接运行 CPU（先确认烧录完整性）"
         ],
         "cpu": [
-            "不要在目标运行时读写内存 / 寄存器（先 halt_cpu）",
+            "CPU 寄存器需要稳定暂停；普通内存和外设读取不会自动暂停",
             "不要在 CPU 运行时设置断点（先 halt_cpu）"
         ],
         "performance": [
@@ -580,7 +580,7 @@ def get_forbidden_operations() -> Dict[str, Any]:
         "reasons": {
             "tool_usage": "优化工具调用顺序可提高性能和用户体验",
             "flash": "Flash 只能按扇区整片擦写，操作顺序错误会损坏数据",
-            "cpu": "目标运行时读写的值不稳定，必须先暂停",
+            "cpu": "一致快照需要暂停；实时观察内存允许保持运行",
             "performance": "避免不必要操作可显著提升响应速度"
         }
     }
