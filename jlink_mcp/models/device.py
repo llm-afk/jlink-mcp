@@ -23,6 +23,7 @@ class ConnectionStatus(BaseModel):
     target_voltage: Optional[float] = Field(None, description="目标电压（V）")
     target_connected: bool = Field(False, description="目标芯片是否已连接")
     firmware_version: Optional[str] = Field(None, description="JLink 固件版本")
+    speed_khz: Optional[int] = Field(None, description="探针当前报告的接口速率（kHz）")
 
 
 class DeviceInfo(BaseModel):

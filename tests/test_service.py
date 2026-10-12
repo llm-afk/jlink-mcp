@@ -63,6 +63,49 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(result["error"]["code"], "STALE_SESSION")
         self.assertFalse(self.probe.mock_calls)
 
+    def test_speed_change_before_read_rejects_without_memory_access(self):
+        self.s.target['requested_speed_khz'] = 20000
+        self.s.image_match = {'status': 'matched'}
+        self.probe.speed = 2000
+        result = self.read()
+        self.assertEqual(result['error']['code'], 'SPEED_MISMATCH')
+        self.assertEqual(result['meta']['target']['speed_khz'], 2000)
+        self.assertEqual(self.s.image_match['status'], 'unknown')
+        self.probe.memory_read.assert_not_called()
+
+    def test_speed_change_during_read_cannot_be_reported_as_20mhz(self):
+        self.s.target['requested_speed_khz'] = 20000
+        self.probe.speed = 20000
+        def reading(*args, **kwargs):
+            self.probe.speed = 2000
+            return [1, 2, 3, 4]
+        self.probe.memory_read.side_effect = reading
+        result = self.read()
+        self.assertEqual(result['error']['code'], 'SPEED_MISMATCH')
+        self.assertEqual(result['meta']['target']['speed_khz'], 2000)
+        self.probe.memory_read.assert_called_once()
+
+    def test_speed_change_during_write_is_unknown_and_not_retried(self):
+        self.s.target['requested_speed_khz'] = 20000
+        self.probe.speed = 20000
+        def writing(*args, **kwargs):
+            self.probe.speed = 2000
+            return 4
+        self.probe.memory_write.side_effect = writing
+        result = self.s.invoke('write', m.WriteRequest(session_id='test', item={
+            'kind': 'memory', 'address': 0x20000000, 'data_hex': '01020304'}))
+        self.assertEqual(result['error']['code'], 'SPEED_MISMATCH')
+        self.assertEqual(result['completion'], 'unknown')
+        self.assertFalse(result['retry_safe'])
+        self.probe.memory_write.assert_called_once()
+
+    def test_close_allowed_after_speed_change(self):
+        self.s.target['requested_speed_khz'] = 20000
+        self.probe.speed = 2000
+        with patch('jlink_mcp.service.connection.disconnect_device', return_value={'success': True}):
+            result = self.s.invoke('session', m.CloseSession(action='close', session_id='test'))
+        self.assertTrue(result['success'])
+
     def test_backend_conflict(self):
         self.gdb.is_running = True
         self.assertEqual(self.read()["error"]["code"], "BACKEND_BUSY")

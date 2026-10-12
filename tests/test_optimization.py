@@ -99,6 +99,23 @@ class OptimizationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'unique'):
             self.elf.variable('counter')
 
+    def test_cached_variable_plan_cannot_be_changed_by_caller(self):
+        original = self.elf.variable('state')
+        changed = self.elf.variable('state')
+        changed['address'] = 0
+        changed['type']['fields'][0]['type']['size'] = 1
+        self.assertEqual(self.elf.variable('state'), original)
+
+    def test_static_plan_cache_is_bounded(self):
+        self.elf.variable('counter')
+        variables = self.elf._variables
+        for index in range(260):
+            name = f'counter_{index}'
+            variables.variables[name] = variables.variables['counter']
+            self.elf.variable(name)
+        self.assertEqual(len(variables._resolved), 256)
+        self.assertNotIn('counter_0', {key[0] for key in variables._resolved})
+
     def test_lma_mapping_ignores_writable_and_bss(self):
         sections, skipped = self.elf.readonly_sections()
         self.assertEqual(sections, [{'name': '.text', 'address': 0x08000000, 'data': b'CODE'}])
@@ -115,6 +132,20 @@ class OptimizationTests(unittest.TestCase):
         self.assertEqual(result['status'], 'mismatch')
         self.assertEqual(result['mismatched_bytes'], 1)
         self.assertEqual(result['ranges'][0]['first_mismatches'][0]['address'], 0x08000001)
+
+    def test_image_fast_path_keeps_later_chunk_mismatches_and_hash(self):
+        import hashlib
+        expected = b'A' * 65544
+        actual = b'A' * 65536 + b'BAAAAAAC'
+        elf = Mock(sha256='test')
+        elf.readonly_sections.return_value = ([dict(name='ro', address=0x08000000, data=expected)], [])
+        config = ProjectProfile(name='test', chip='test', regions=[
+            dict(name='flash', address=0x08000000, size=len(expected), kind='flash')])
+        result = compare_image(elf, config, lambda address, size: actual[address - 0x08000000:address - 0x08000000 + size])
+        self.assertEqual(result['mismatched_bytes'], 2)
+        self.assertEqual(result['compared_bytes'], len(expected))
+        self.assertEqual([x['address'] for x in result['ranges'][0]['first_mismatches']], [0x08010000, 0x08010007])
+        self.assertEqual(result['ranges'][0]['actual_sha256'], hashlib.sha256(actual).hexdigest())
 
     def test_mutable_exclusion_partial_and_unknown(self):
         elf = Mock(sha256='test')
@@ -154,7 +185,7 @@ class OptimizationTests(unittest.TestCase):
 
     def test_typed_reads_guard_and_explicit_override(self):
         s = self.service()
-        s.probe.memory_read.return_value = list(struct.pack('<I', 42))
+        s.probe.memory_read.return_value = [42]
         def read(**kwargs):
             return s.read(m.ReadBatch(action="read", session_id='test', items=[dict(kind='variable', name='counter', **kwargs)]))
         blocked = read()
@@ -167,6 +198,31 @@ class OptimizationTests(unittest.TestCase):
         s.image_match = {'status': 'matched'}
         self.assertTrue(read()['success'])
         s.probe.halt.assert_not_called()
+
+    def test_cached_plan_reads_fresh_memory_and_still_checks_match(self):
+        s = self.service()
+        s.image_match = {'status': 'matched'}
+        s.probe.memory_read.side_effect = [[42], [43]]
+        request = m.ReadBatch(action='read', session_id='test', items=[dict(kind='variable', name='counter')])
+        self.assertEqual(s.read(request)['items'][0]['data']['value'], 42)
+        self.assertEqual(s.read(request)['items'][0]['data']['value'], 43)
+        s.image_match = {'status': 'unknown'}
+        self.assertEqual(s.read(request)['items'][0]['error']['code'], 'IMAGE_NOT_MATCHED')
+        self.assertEqual(s.probe.memory_read.call_count, 2)
+
+    def test_typed_access_width_uses_exact_aligned_span(self):
+        for address, width, values in [(0x20000000, 32, [0x44332211]),
+                                       (0x20000002, 16, [0x2211, 0x4433]),
+                                       (0x20000001, 8, [0x11, 0x22, 0x33, 0x44])]:
+            with self.subTest(width=width):
+                s = self.service()
+                s.image_match = {'status': 'matched'}
+                info = dict(address=address, size=4, type=dict(name='uint32_t', kind='unsigned', size=4))
+                s.probe.memory_read.return_value = values
+                with patch.object(s.symbols, 'variable', return_value=info):
+                    result = s.read(m.ReadBatch(action='read', session_id='test', items=[dict(kind='variable', name='counter')]))
+                self.assertEqual(result['items'][0]['data']['value'], 0x44332211)
+                s.probe.memory_read.assert_called_once_with(address, 32 // width, nbits=width)
 
     def test_verification_failure_invalidates_previous_match(self):
         s = self.service()
@@ -227,7 +283,7 @@ class OptimizationTests(unittest.TestCase):
             self.assertTrue(result['success'], result)
             self.assertEqual(s.target['chip'], 'GD32C103CB')
             self.assertEqual(s.symbols.path, str(self.path))
-            conn.connect_device.assert_called_once_with('123', 'SWD', 'GD32C103CB', None)
+            conn.connect_device.assert_called_once_with('123', 'SWD', 'GD32C103CB', None, speed_khz='auto')
 
     def test_reset_and_write_invalidate_match(self):
         s = self.service()
@@ -238,6 +294,24 @@ class OptimizationTests(unittest.TestCase):
         with self.assertRaises(Exception):
             s.write(m.WriteRequest(session_id='test', item=dict(kind='memory', address=0x20000000, data_hex='01')))
         self.assertEqual(s.image_match['status'], 'unknown')
+
+    def test_profile_speed_inherited_and_can_be_overridden(self):
+        path = Path(self.temp.name) / 'speed-profile.json'
+        path.write_text(profile(speed_khz=20000).model_dump_json())
+        for speed in (None, 2000, 'auto'):
+            with self.subTest(speed=speed), patch('jlink_mcp.service.jlink_manager') as manager, patch('jlink_mcp.service.gdb_server_manager') as gdb, patch('jlink_mcp.service.connection') as conn:
+                manager.is_connected = gdb.is_running = False
+                expected = 20000 if speed is None else speed
+                actual = 2000 if expected == 'auto' else expected
+                manager.get_jlink.return_value.speed = actual
+                conn.connect_device.return_value = {'success': True, 'speed_khz': actual}
+                conn.get_connection_status.return_value = {'success': True, 'data': {'target_connected': True, 'device_serial': '123'}}
+                s = DebugService()
+                result = s.invoke('session', m.OpenSession(action='open', profile_path=str(path), serial_number='123', speed_khz=speed))
+                self.assertTrue(result['success'], result)
+                self.assertEqual(s.target['requested_speed_khz'], expected)
+                self.assertEqual(s.target['speed_khz'], actual)
+                self.assertEqual(conn.connect_device.call_args.kwargs['speed_khz'], expected)
 
     def test_malformed_types_are_bounded(self):
         from types import SimpleNamespace

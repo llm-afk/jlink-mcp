@@ -19,6 +19,7 @@ from .models.device import (
 )
 from .utils import logger, find_jlink_dll
 from .device_patch_manager import device_patch_manager
+from .api_models import Speed
 
 
 class JLinkManager:
@@ -113,7 +114,8 @@ class JLinkManager:
         serial_number: Optional[str] = None,
         interface: TargetInterface = TargetInterface.SWD,
         chip_name: Optional[str] = None,
-        jlink_path: Optional[str] = None
+        jlink_path: Optional[str] = None,
+        speed_khz: Speed = "auto"
     ) -> None:
         """连接到 JLink 设备.
 
@@ -123,6 +125,7 @@ class JLinkManager:
             chip_name: 目标芯片名称（如 STM32F407VG），None 则尝试自动检测
             jlink_path: 指定 JLink 安装目录或 JLink_x64.dll 文件路径（可选，
                 如 D:\\Program Files\\SEGGER\\JLink_V942）；None 则自动选择最新版本
+            speed_khz: auto 或固定 kHz；固定值要求探针读回完全一致
 
         Raises:
             AlreadyConnectedError: 如果已连接
@@ -181,12 +184,26 @@ class JLinkManager:
             else:
                 raise ConnectionError(f"不支持的接口类型: {interface}")
 
+            if isinstance(speed_khz, int):
+                info = self._jlink.speed_info
+                if not info.MinDiv or speed_khz * 1000 * info.MinDiv > info.BaseFreq:
+                    raise ConnectionError(f"Probe speed capability does not support {speed_khz} kHz")
+                if speed_khz > self._jlink.MAX_JTAG_SPEED:
+                    # Only this instance may exceed pylink's historical 12MHz cap.
+                    self._jlink.MAX_JTAG_SPEED = min(50000, info.BaseFreq // info.MinDiv // 1000)
+
+            # Set speed before device selection, which can itself initiate a connection.
+            if speed_khz == "auto":
+                self._jlink.set_speed(auto=True)
+            else:
+                self._jlink.set_speed(speed_khz)
+
             # 连接目标芯片
             if chip_name:
                 # 优先直接用 pylink 原生设备数据库连接（支持 GD32/STM32/Cortex-M 等）
                 logger.info(f"连接到芯片: {chip_name}")
                 try:
-                    self._jlink.connect(chip_name)
+                    self._jlink.connect(chip_name, speed=speed_khz)
                 except Exception as conn_err:
                     # 原生数据库失败时，尝试设备补丁智能匹配（如 Flagchip 自定义设备）
                     suggestion = ""
@@ -198,7 +215,7 @@ class JLinkManager:
                         matched_name = match_result[0]
                         logger.info(f"设备名称智能匹配: {chip_name} -> {matched_name}")
                         try:
-                            self._jlink.connect(matched_name)
+                            self._jlink.connect(matched_name, speed=speed_khz)
                             chip_name = matched_name
                         except Exception as retry_err:
                             raise ConnectionError(
@@ -210,19 +227,23 @@ class JLinkManager:
                         if similar:
                             suggestion = f"\n您是否想找: {', '.join(similar)}"
                         raise ConnectionError(
-                            f"无法连接到芯片 '{chip_name}'{suggestion}",
+                            f"无法连接到芯片 '{chip_name}'，请求速率 {speed_khz} kHz{suggestion}",
                             conn_err
                         )
                 self._device_name = chip_name
             else:
-                self._device_name = self._autodetect_chip()
+                self._device_name = self._autodetect_chip(speed_khz)
 
             self._target_connected = self._jlink.target_connected()
+
+            actual_speed = self._jlink.speed
+            if isinstance(speed_khz, int) and actual_speed != speed_khz:
+                raise ConnectionError(f"Requested {speed_khz} kHz, probe reports {actual_speed} kHz; no speed fallback")
 
             self._connected = True
             self._device_serial = str(self._jlink.serial_number)
 
-            logger.info(f"成功连接到设备: {self._device_serial}")
+            logger.info(f"成功连接到设备: {self._device_serial}，请求速率: {speed_khz}，探针读回: {actual_speed} kHz")
 
         except Exception as e:
             self._cleanup()
@@ -230,7 +251,7 @@ class JLinkManager:
                 raise DeviceNotFoundError(f"设备 {serial_number} 未找到", e)
             raise ConnectionError(str(e), e)
 
-    def _autodetect_chip(self) -> str:
+    def _autodetect_chip(self, speed_khz: Speed = "auto") -> str:
         """自动检测芯片：依次尝试通用内核名、常见设备名和补丁设备名.
 
         Returns:
@@ -260,7 +281,7 @@ class JLinkManager:
         for chip in candidates:
             try:
                 logger.info(f"尝试芯片: {chip}")
-                self._jlink.connect(chip)
+                self._jlink.connect(chip, speed=speed_khz)
                 logger.info(f"成功连接到芯片: {chip}")
                 return chip
             except Exception as e:
@@ -325,6 +346,11 @@ class JLinkManager:
             voltage = None
             fw_version = None
 
+        try:
+            speed_khz = self._jlink.speed
+        except Exception:
+            speed_khz = None
+
         # 确保 device_serial 有有效值
         device_serial = self._device_serial
         if device_serial is None:
@@ -340,7 +366,8 @@ class JLinkManager:
             target_interface=self._target_interface,
             target_voltage=voltage,
             target_connected=self.is_target_connected,
-            firmware_version=fw_version
+            firmware_version=fw_version,
+            speed_khz=speed_khz
         )
 
     def get_target_info(self) -> TargetDeviceInfo:

@@ -1,5 +1,6 @@
 """Shared byte-oriented contracts over pylink's unit-oriented API."""
 import time
+import struct
 
 from .exceptions import JLinkMCPError, JLinkErrorCode
 
@@ -20,7 +21,18 @@ def read_bytes(jlink, address, size, width=8):
     values = jlink.memory_read(address, size // unit, nbits=width)
     if len(values) != size // unit:
         raise JLinkMCPError(JLinkErrorCode.READ_FAILED, f'短读：期望 {size // unit} 单元，实际 {len(values)}')
-    return b''.join(int(v).to_bytes(unit, 'little') for v in values)
+    if unit == 1:
+        return bytes(values)
+    return struct.pack(f'<{len(values)}{"H" if unit == 2 else "I"}', *values)
+
+
+def aligned_width(address, size):
+    """Largest exact-span access for profiled RAM/Flash, never implicit MMIO."""
+    if address % 4 == 0 and size % 4 == 0:
+        return 32
+    if address % 2 == 0 and size % 2 == 0:
+        return 16
+    return 8
 
 
 def write_bytes(jlink, address, data, width=8):

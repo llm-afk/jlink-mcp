@@ -26,7 +26,7 @@ def main():
         except Exception as exc:
             result = error_result(exc)
         # ASCII escapes keep the JSON pipe compatible with Windows console encodings.
-        sys.stdout.write(json.dumps(result, ensure_ascii=True) + "\n")
+        sys.stdout.write(json.dumps(result, ensure_ascii=True, separators=(',', ':')) + "\n")
         sys.stdout.flush()
         if method == "_close":
             return

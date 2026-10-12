@@ -7,6 +7,7 @@ Address = Annotated[int, Field(ge=0, le=0xFFFFFFFF)]
 Name = Annotated[str, Field(min_length=1, max_length=256)]
 Size = Annotated[int, Field(gt=0, le=65536)]
 Width = Literal[8, 16, 32]
+Speed = Union[Literal["auto"], Annotated[int, Field(ge=5, le=50000)]]
 
 
 class Request(BaseModel):
@@ -27,6 +28,7 @@ class OpenSession(Request):
     svd_device: Name | None = None
     elf_path: str | None = None
     jlink_path: str | None = None
+    speed_khz: Speed | None = Field(default=None, description="Interface speed in kHz or auto; inherits profile when omitted. Fixed speed requires identical probe readback.")
 
     @model_validator(mode="after")
     def target_required(self):

@@ -23,7 +23,7 @@ from .source_context import disassemble
 from .fault_context import recover_frame, decode_fault_flags
 from .dwarf_variables import decode
 from .svd_manager import svd_manager
-from .target_access import read_bytes, write_bytes, validate_span, register_name
+from .target_access import read_bytes, write_bytes, validate_span, register_name, aligned_width
 from .tools import connection, debug, flash, rtt, svd
 
 
@@ -87,11 +87,20 @@ class DebugService:
         self.snapshots.clear()
         self.image_match = {"status": "unknown", "reason": "session or target state changed"}
 
+    def _verify_speed(self):
+        requested = (self.target or {}).get("requested_speed_khz")
+        if self.probe is not None and isinstance(requested, int):
+            actual = self.probe.speed
+            self.target["speed_khz"] = actual
+            if actual != requested:
+                self._invalidate()
+                raise ServiceError("SPEED_MISMATCH", f"Requested {requested} kHz, probe reports {actual} kHz")
+
     def invoke(self, method, request=None):
         # Shared across all tools, including snapshots and sampling. No overlapping calls
         # into the DLL or replacement of a connection during a long operation.
         with self.lock:
-            started, timestamp = time.monotonic(), utc_now()
+            started, timestamp = time.perf_counter(), utc_now()
             before = "unknown"
             authorized = False
             try:
@@ -99,9 +108,13 @@ class DebugService:
                     raise ServiceError("UNKNOWN_TOOL", "Use a tool from the current tools/list")
                 if isinstance(request, contracts.Bound):
                     self._require(request.session_id, not isinstance(request, contracts.CloseSession))
+                    if not isinstance(request, contracts.CloseSession):
+                        self._verify_speed()
                 authorized = True
                 before = self._state()
                 result = getattr(self, method)(request)
+                if not isinstance(request, contracts.CloseSession):
+                    self._verify_speed()
             except Exception as exc:
                 result = error_result(exc)
                 if method in ("write", "control", "firmware"):
@@ -109,7 +122,7 @@ class DebugService:
                     result["retry_safe"] = False
             result["meta"] = {"session_id": self.session_id, "target": copy.deepcopy(self.target),
                               "generation": self.generation, "timestamp": timestamp,
-                              "duration_ms": round((time.monotonic() - started) * 1000, 3),
+                              "duration_ms": round((time.perf_counter() - started) * 1000, 3),
                               "cpu_before": before, "cpu_after": self._state() if authorized else "unknown"}
             return result
 
@@ -159,18 +172,20 @@ class DebugService:
                 value = getattr(request, field)
                 if value is not None and value != getattr(profile, field):
                     raise ServiceError("PROFILE_MISMATCH", f"Cannot override profile {field}; use a matching profile")
-        fields = ("chip", "serial_number", "interface", "architecture", "svd_device", "elf_path", "jlink_path")
+        fields = ("chip", "serial_number", "interface", "architecture", "svd_device", "elf_path", "jlink_path", "speed_khz")
         resolved = {field: getattr(request, field) if getattr(request, field) is not None
                     else getattr(profile, field, None) for field in fields}
         resolved["interface"] = resolved["interface"] or "SWD"
         resolved["architecture"] = resolved["architecture"] or "unknown"
+        resolved["speed_khz"] = resolved["speed_khz"] if resolved["speed_khz"] is not None else "auto"
         request = contracts.OpenSession(action="open", **resolved)
         symbols = SymbolFile(request.elf_path) if request.elf_path else None
         if symbols and request.architecture == "cortex-m" and symbols.machine != "EM_ARM":
             raise ServiceError("ARCH_MISMATCH", "Cortex-M requires an ARM ELF")
         if request.svd_device and request.svd_device not in svd_manager.device_names:
             raise ServiceError("SVD_NOT_FOUND", "Use an exact SVD device name from discover")
-        result = connection.connect_device(request.serial_number, request.interface, request.chip, request.jlink_path)
+        result = connection.connect_device(request.serial_number, request.interface, request.chip, request.jlink_path,
+                                           speed_khz=request.speed_khz)
         if not result.get("success"):
             return result
         actual = connection.get_connection_status()
@@ -182,6 +197,7 @@ class DebugService:
         self.target = {"chip": request.chip, "serial_number": request.serial_number,
                        "actual_serial_number": str(actual["data"]["device_serial"]),
                        "interface": request.interface, "architecture": request.architecture,
+                       "requested_speed_khz": request.speed_khz, "speed_khz": result.get("speed_khz"),
                        "svd_device": request.svd_device}
         self.symbols = symbols
         self.profile, self.profile_identity = profile, profile_identity
@@ -243,7 +259,8 @@ class DebugService:
             if not any(r.address <= info["address"] and info["address"] + info["size"] <= r.address + r.size
                        for r in self.profile.regions):
                 raise ServiceError("OUTSIDE_PROFILE", "Variable lies outside configured RAM/Flash")
-            return {"kind": "variable", "address": info["address"], "bytes": info["size"], "width": 8, "type": info["type"]}
+            return {"kind": "variable", "address": info["address"], "bytes": info["size"],
+                    "width": aligned_width(info["address"], info["size"]), "type": info["type"]}
         else:
             address, info, peripheral, register = self._peripheral(item.name)
             if info.access == "write-only":
@@ -671,7 +688,8 @@ class DebugService:
             if not self.symbols or not self.profile:
                 raise ServiceError("PROFILE_REQUIRED", "ELF image comparison requires an ELF and profiled Flash regions")
             self.image_match = {"status": "unknown", "reason": "comparison in progress"}
-            result = compare_image(self.symbols, self.profile, lambda address, size: read_bytes(self.probe, address, size))
+            result = compare_image(self.symbols, self.profile, lambda address, size: read_bytes(
+                self.probe, address, size, aligned_width(address, size)))
             result.update(timestamp=utc_now(), generation=self.generation, profile=self.profile_identity)
             self.image_match = copy.deepcopy(result)
             return result

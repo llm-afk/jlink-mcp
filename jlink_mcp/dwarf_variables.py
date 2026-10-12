@@ -2,9 +2,17 @@
 import math
 import re
 import struct
+from collections import OrderedDict
+from copy import deepcopy
+from functools import lru_cache
 
 from elftools.dwarf.descriptions import describe_form_class
 from elftools.dwarf.dwarf_expr import DWARFExprParser
+
+
+@lru_cache(maxsize=128)
+def expression_parser(structs):
+    return DWARFExprParser(structs)
 
 
 def attr(die, name, default=None):
@@ -84,7 +92,7 @@ def member_offset(member):
     if describe_form_class(value.form) == "constant":
         offset = value.value
     else:
-        operations = DWARFExprParser(member.cu.structs).parse_expr(value.value)
+        operations = expression_parser(member.cu.structs).parse_expr(value.value)
         if len(operations) != 1 or operations[0].op_name != "DW_OP_plus_uconst":
             raise ValueError("Only constant member offsets are supported")
         offset = operations[0].args[0]
@@ -173,6 +181,7 @@ def decode(schema, data, budget=None):
 class DwarfVariables:
     def __init__(self, elf):
         self.variables = {}
+        self._resolved = OrderedDict()
         if not elf.has_dwarf_info():
             return
         for cu in elf.get_dwarf_info().iter_CUs():
@@ -186,7 +195,7 @@ class DwarfVariables:
                 if location is None or describe_form_class(location.form) not in ("exprloc", "block"):
                     continue
                 try:
-                    operations = DWARFExprParser(cu.structs).parse_expr(location.value)
+                    operations = expression_parser(cu.structs).parse_expr(location.value)
                 except Exception:
                     # An unsupported vendor/TLS location must not hide other globals.
                     continue
@@ -201,6 +210,11 @@ class DwarfVariables:
         if len(candidates) != 1:
             raise ValueError(f"Global {root!r} has no unique static DWARF location (missing, optimized out, or ambiguous)")
         address, variable = candidates[0]
+        # Cache static ELF plans only; recheck the root before using any cached plan.
+        key = (expression, address, id(variable))
+        if key in self._resolved:
+            self._resolved.move_to_end(key)
+            return deepcopy(self._resolved[key])
         die = variable.get_DIE_from_attribute("DW_AT_type")
         base, total = address, byte_size(die)
         tokens = re.findall(r"\.([A-Za-z_][A-Za-z_0-9]*)|\[([0-9]+)\]", expression[len(root):])
@@ -238,4 +252,8 @@ class DwarfVariables:
         schema = describe(die)
         if address < base or address + schema["size"] > base + total:
             raise ValueError("Selected variable lies outside its global object")
-        return {"expression": expression, "address": address, "size": schema["size"], "type": schema}
+        result = {"expression": expression, "address": address, "size": schema["size"], "type": schema}
+        if len(self._resolved) >= 256:
+            self._resolved.popitem(last=False)
+        self._resolved[key] = result
+        return deepcopy(result)

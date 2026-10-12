@@ -5,6 +5,7 @@ from typing import List, Dict, Any
 from ..jlink_manager import jlink_manager
 from ..models.device import TargetInterface
 from ..utils import logger
+from ..api_models import Speed
 
 
 def list_jlink_devices() -> List[Dict[str, Any]]:
@@ -24,7 +25,7 @@ def list_jlink_devices() -> List[Dict[str, Any]]:
     return [device.model_dump() for device in devices]
 
 
-def connect_device(serial_number: str | None = None, interface: str | None = None, chip_name: str | None = None, jlink_path: str | None = None) -> Dict[str, Any]:
+def connect_device(serial_number: str | None = None, interface: str | None = None, chip_name: str | None = None, jlink_path: str | None = None, speed_khz: Speed = "auto") -> Dict[str, Any]:
     """连接到 JLink 设备.
 
     连接到指定的 JLink 调试器。如果不指定序列号，则连接第一个可用设备。
@@ -36,6 +37,7 @@ def connect_device(serial_number: str | None = None, interface: str | None = Non
         chip_name: 目标芯片名称（可选，支持缩写自动匹配，如 FC7300F4MDD）
         jlink_path: 指定 JLink 安装目录或 JLink_x64.dll 文件路径（可选，
             如 D:\\Program Files\\SEGGER\\JLink_V942）；None 则自动选择最新版本
+        speed_khz: auto 或固定速率，单位 kHz；固定速率读回不符时失败
 
     Returns:
         连接结果，包含:
@@ -49,13 +51,14 @@ def connect_device(serial_number: str | None = None, interface: str | None = Non
             interface = "SWD"
 
         interface_enum = TargetInterface(interface.upper())
-        jlink_manager.connect(serial_number, interface_enum, chip_name, jlink_path)
+        jlink_manager.connect(serial_number, interface_enum, chip_name, jlink_path, speed_khz=speed_khz)
         status = jlink_manager.get_connection_status()
 
         logger.info(f"成功连接到设备: {status.device_serial}")
         return {
             "success": True,
             "serial_number": status.device_serial,
+            "speed_khz": status.speed_khz,
             "message": f"成功连接到设备 {status.device_serial}，接口: {interface}"
         }
     except Exception as e:

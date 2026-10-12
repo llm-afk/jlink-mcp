@@ -36,7 +36,8 @@ async def discover() -> dict:
 async def session(request: SessionRequest) -> dict:
     """Open/status/close a single probe session. Open requires explicit chip and serial.
 
-    profile_path can supply chip, architecture, paths and memory regions.
+    profile_path can supply chip, architecture, paths, memory regions and speed_khz.
+    Fixed speed requires matching probe readback; status reports the current speed.
     Optional ELF provides raw symbols and bounded static DWARF types; target
     matching is unknown until firmware verify_image. Loading never writes debug bits.
     Use the returned session_id in all subsequent target operations.

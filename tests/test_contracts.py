@@ -27,6 +27,14 @@ class Contracts(unittest.TestCase):
             self.probe.memory_read.assert_called_with(0x20000000, 32 // width, nbits=width)
         self.probe.halt.assert_not_called()
 
+    def test_read_high_bit_unsigned_units(self):
+        for width, values, expected in [(8, [0x80, 0xff], b'\x80\xff'),
+                                        (16, [0x8000, 0xffff], b'\x00\x80\xff\xff'),
+                                        (32, [0x80000000, 0xffffffff], b'\x00\x00\x00\x80\xff\xff\xff\xff')]:
+            with self.subTest(width=width):
+                self.probe.memory_read.return_value = values
+                self.assertEqual(target_access.read_bytes(self.probe, 0x20000000, len(expected), width), expected)
+
     def test_write_width_and_byte_order(self):
         self.probe.memory_write.return_value = 4
         self.assertTrue(memory.write_memory(0x20000000, '12 34 56 78', 32)['success'])

@@ -76,7 +76,7 @@ class DriverWorker:
 
     def _exchange(self, method, request, timeout):
         payload = request.model_dump(mode="json") if hasattr(request, "model_dump") else request
-        self.process.stdin.write(json.dumps({"method": method, "request": payload}) + "\n")
+        self.process.stdin.write(json.dumps({"method": method, "request": payload}, separators=(',', ':')) + "\n")
         self.process.stdin.flush()
         try:
             result = self.responses.get(timeout=timeout)
@@ -88,7 +88,7 @@ class DriverWorker:
 
     def invoke(self, method, request=None, timeout=None):
         with self.lock:
-            started = time.monotonic()
+            started = time.perf_counter()
             try:
                 self._start()
                 return self._exchange(method, request, timeout if timeout is not None else self.deadline(method, request))
@@ -98,7 +98,7 @@ class DriverWorker:
                                                     "message": str(exc)},
                         "completion": "unknown", "retry_safe": False, "session_lost": True,
                         "meta": {"session_id": None, "cpu_after": "unknown",
-                                 "duration_ms": round((time.monotonic() - started) * 1000, 3)},
+                                 "duration_ms": round((time.perf_counter() - started) * 1000, 3)},
                         "recovery": "Open a new session explicitly; inspect target state before deciding the next action"}
 
     def close(self):

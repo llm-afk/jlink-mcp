@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from .api_models import Speed
 
 
 class ProfileModel(BaseModel):
@@ -49,6 +50,7 @@ class ProjectProfile(ProfileModel):
     svd_device: str | None = None
     elf_path: str | None = None
     jlink_path: str | None = None
+    speed_khz: Speed = "auto"
     regions: Annotated[list[Region], Field(max_length=64)] = Field(default_factory=list)
     debug_checks: Annotated[list[DebugCheck], Field(max_length=16)] = Field(default_factory=list)
 

@@ -31,6 +31,8 @@ def compare_image(symbols, profile, read):
                         raise ValueError("Short read during image comparison")
                     digest.update(actual)
                     read_size += len(actual)
+                    if actual == want:
+                        continue
                     for index, (a, b) in enumerate(zip(actual, want)):
                         if a != b:
                             different += 1

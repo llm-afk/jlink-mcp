@@ -1,5 +1,13 @@
 # 迁移到精简接口
 
+## 0.6.0 → 0.6.1：性能与速率
+
+仍为 8 个工具，既有 action/kind、会话和匹配约定保持。session open 和项目配置新增可选 `speed_khz`，auto 或 5–50000 的整数 kHz；不配置时保持 auto。c1_driver 示例声明实板验证通过的 10000 kHz（10 MHz），20 MHz 连接及读取失败后经工程用户同意采用此速率。
+
+固定速率校验探针能力及读回；操作前后读回不符时返回 SPEED_MISMATCH，清除匹配证据，不自动改用其他速率。异常发生在写入等动作之后时仍返回 completion=unknown、retry_safe=false，不能直接重发写入。session close 仍可用于释放连接。session status 的 connection.data 新增当前 speed_khz；meta.target 增加 requested_speed_khz 和 speed_khz。
+
+静态 ELF 解析计划缓存不缓存目标值，类型读取仍逐次检查映像匹配和项目范围。仅配置 RAM/Flash 的类型读取和映像比较自动选择精确范围内的对齐宽度；原始内存和 SVD 请求继续使用显式宽度。耗时改用高分辨率计时，毫秒值不再受旧 Windows 时钟粒度影响。升级后重载服务并刷新 tools/list 即可使用新增参数。
+
 ## 0.5.1 → 0.6.0：八个工具
 
 当前工具为 discover、session、read、write、control、inspect、firmware、channel。

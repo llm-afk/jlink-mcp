@@ -1,5 +1,53 @@
 # 验证记录
 
+## 2026-10-12：0.6.1 性能优化与 20 MHz 检查
+
+对外仍为 8 个工具。优化 DWARF 表达式解析器复用和最多 256 项的静态地址/类型计划缓存；目标值逐次读取并继续校验映像和配置范围。8/16/32 位数据转换使用批量字节/小端打包，类型读取和只读映像校验使用不扩大范围的对齐宽度；MMIO/SVD 宽度保持显式。匹配镜像块直接跳过逐字节差异遍历，仍计算完整散列和后续块差异。耗时使用 perf_counter，内部 JSON 使用紧凑分隔符并保持 ASCII 转义。
+
+当前 c1_driver 源码经 Keil ARMCC 5.06 update 7 重编译：APP_VERSION=143，0 errors / 7 warnings。AXF SHA256 `6196970b28e603874acecf97771454cd13b155d4989bca78ab1677806928ce15`；重新导出的 BIN 为 38,408 字节，SHA256 `75ec3fe010adf6619baf897f76a71963b12cbc85fe0863f47c1d2120dfb75509`，与 AXF PT_LOAD 字节一致。只生成构建产物，没有改写该工程源码。
+
+用户确认功率输出已关闭后，基线与优化代码均通过完整实板调试脚本：双读全 Flash 备份、编程当前 BIN、校验 BIN 范围外字节保留（含参数区）、ELF matched、main/servo_loop 硬件断点、BusVoltage 写观察点、两种超时策略及 RAM UDF 异常帧恢复。恢复临时 RAM 和 DBG_CTL=0x00000400，最终当前 APP running，探针释放。证据分别在 `.local/validation/debug_20261012_160950/` 和 `.local/validation/debug_20261012_162723/`。这两次使用 auto，发生在要求 20 MHz 之前。
+
+基准使用同一个上述 AXF、探针 SN 174504233 和 auto 模式（另行实际读回 2000 kHz）。真实 MCP 数据为预热后每项 15 次完整请求的中位数；主机基准为 7 组多次调用的每次耗时中位数。主机项目不含 USB/SWD 时间。
+
+| 项目 | 优化前 ms | 优化后 ms | 范围 |
+|---|---:|---:|---|
+| MotorControl 结构体读取 | 13.8386 | 5.1999 | 真实 MCP，约 2.66 倍 |
+| MotorControl.Iq 读取 | 2.6038 | 2.3673 | 真实 MCP |
+| 64 KiB Flash，8 位读取 | 418.6373 | 410.8791 | 真实 MCP，约 1.9% 改善 |
+| ELF 只读映像校验 | 247.0680 | 239.9328 | 真实 MCP |
+| MotorControl 地址/类型解析 | 3.4302 | 0.2001 | 主机，缓存预热后 |
+| 64 KiB，8 位字节转换 | 7.4592 | 0.1879 | 主机 |
+| 匹配镜像块比较 | 1.8133 | 0.2174 | 主机 |
+
+较大的 Flash 读取仍主要受传输时间影响，主机转换加速不能等同于 SWD 吞吐加速。报告 `.local/performance_20261012/before.json`、`after.json`、`comparison.json` 含平台、固件散列、源码散列和原始耗时，保留对应 pstats 和服务日志。
+
+按用户要求尝试 `speed_khz=20000`。探针 speed_info 报告 BaseFreq=1600000000 Hz、MinDiv=32，可设置 20000 kHz；读回也确为 20000。但固定 20 MHz 的真实 MCP 连接两次失败。独立 PyLink 诊断先以 auto 读取 CPUID=0x410FC241、DBG_ID=0x17120410，固件全部 38,408 字节与 BIN 相同；随后设为 20000 kHz，第一次 CPUID 读取即返回 Unspecified error。提前设定速度再选择设备也未解决。上述结果没有形成 20 MHz 的性能或稳定性通过证据。
+
+20 MHz 下厂商 InitTarget 日志报告 secured/unsecure 拒绝，auto 下报告 No Protection is set；不能据此认定芯片真正受保护，20 MHz 诊断没有解锁、擦除或重新烧录。失败时释放了探针。失败证据在 `.local/performance_20261012/after_20m_fixed.json` 及服务日志，独立诊断在 `probe_speed_diagnostic.json`。若要使用 20 MHz，仍需检查目标支持的接口速率与信号质量后重测；[SEGGER 排障说明](https://kb.segger.com/J-Link_Troubleshooting)也要求用原生工具确认接口设置和信号质量。
+
+用户随后同意使用 10 MHz 或探测其他有效速率。固定 10000 kHz 的真实 MCP 全部只读基准通过，逐请求和最后状态均读回 10000 kHz，CPU 始终 running，ELF matched。每项仍为 15 次请求中位数，报告 `.local/performance_20261012/after_10m.json`：
+
+| 项目 | 基线 auto ms | 优化后 10 MHz ms | 总加速倍数 |
+|---|---:|---:|---:|
+| 64 KiB Flash，8 位读取 | 418.6373 | 108.2371 | 3.87 |
+| MotorControl 结构体读取 | 13.8386 | 3.3794 | 4.10 |
+| ELF 只读映像校验 | 247.0680 | 63.8599 | 3.87 |
+
+此表包含软件优化和速率变化两个因素，不将全部收益归因于代码。c1_driver 最终配置固定为 10000 kHz；这一次是用户允许后的显式选择。完整实板脚本再于 10 MHz 通过上述备份、烧录、保留范围、断点/观察点、超时和真实 UDF 故障恢复流程，证据 `.local/validation/debug_20261012_164849/`。最终 BIN/ELF 校验通过、CPU running、DBG_CTL 与临时 RAM 恢复、探针释放。最终只读复验也通过，证据 `.local/validation/profile_20261012_165103/`，包含 8 工具 schema、8/16/32 位一致性、类型读取、快照/差异/采样、配置检查和连接释放。
+
+随后重新连接出现故障：10 MHz 再次连接失败，8 MHz 也失败。独立原生诊断依次测试 10/8/6/4/2 MHz，都在连接阶段失败；有/无探针能力查询的 10 MHz 试验均失败，排除了本次新增查询是唯一触发条件。参考电压保持 3300 mV，日志报告无法清除 sticky 错误/无法给调试端口上电。6 MHz 的探针量化读回为 5993 kHz，其余测试整数档位读回为请求值；这些均没有形成成功的读取证据。
+
+100 kHz 连接及一次 30 ms 复位脉冲后的重连仍失败，复位引脚读回曾从 1→0→1，最后释放为高；没有解锁、擦除或 Flash 写入，探针已释放。证据 `.local/performance_20261012/native_speed_reconnect.json`、`recover_connection.json`、`after_8m.json` 和 `readonly-release.log`。因此不能将后续故障只归因于高速率，也不能声称已经找到接口最高速率。
+
+用户随后确认 MCU/J-Link 已重新上电。最终源码在 10000 kHz 下再次通过全部 15 次/项的真实 MCP 基准，报告 `.local/performance_20261012/after_10m_repower.json`；64 KiB 8 位读取中位数 108.4223 ms，MotorControl 为 3.3357 ms，映像校验为 63.9352 ms，与前一次成功结果接近。完整固件映像 matched，前后 CPU running。再通过 6 次连续关闭/打开会话，每次比较 64 KiB Flash 的 8/16/32 位读取数据完全一致并验证映像 matched；第 6 次会话持续 60 轮、约 1 秒间隔读取 CPUID、固定 Flash 和实时 MotorControl.Iq，速率读回始终 10000 kHz、CPU 始终 running，最后释放探针。证据 `.local/performance_20261012/audit_reconnect.json`。当前配置保留明确验证通过的 10000 kHz，不自动降速或重复未知结果的写入。重新上电恢复的具体根因未确定，不将它解释为已解决的固件缺陷。
+
+固定速度由 session/profile 显式选择，核对硬件能力和实际读回；操作前后读回不符时失败、使匹配证据失效，不在软件中自动降速。晚于写入的速率异常保留未知完成状态且不重试。完整离线回归 **140 项通过**，含字节序/高位值、缓存隔离/容量、匹配差异和读数新鲜性，以及速率透传、配置继承/覆盖、不符读回、失败释放、禁止自动重试等检查。最终日志 `.local/performance_20261012/tests-release.log`。
+
+只读复现：`scripts/benchmark.py --elf <当前AXF> --serial 174504233 --speed-khz 10000 --output <新JSON路径>`；不带 serial 时只运行主机基准，不触碰硬件，失败也保存报告。软件测试与 10 MHz 实板通过、20 MHz 实板失败分开记录。
+
+最终安装包 `.local/performance_20261012/dist/jlink_mcp-0.6.1-py3-none-any.whl` 已离线构建；33 个 Python 文件与工作区逐字节一致，包含 4 份 SVD，解压后的隔离导入确认为版本 0.6.1 和 8 个工具。SHA256 `0d508917db733a982806fdedde0c09b528c871c3bb475a0da0c3205eb37855a6`，报告 `.local/performance_20261012/release-verification.json`。固件、Flash 备份、安装包和原始测试数据保存在忽略的 .local 目录，不随源码上传。
+
 ## 2026-10-12：0.6.0 接口收敛与实板复验
 
 基于 GitHub main 的 `755a892` 收敛到 8 个工具：capture 的 snapshot/diff/sample 归入 read，breakpoint 的设置/移除/列举归入 control。read 明确 action="read"，断点动作明确 breakpoint_set/remove/list；原有能力、类型边界、会话锁、硬件断点归属和超时策略保留。原生请求模型共用登记表并在子进程启动时缓存解析器。

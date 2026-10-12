@@ -1,4 +1,4 @@
-# J-Link MCP 0.6.0
+# J-Link MCP 0.6.1
 
 面向嵌入式调试任务的 MCP 服务。对外提供 **8 个工具**：读取与采集统一到 read，执行控制与断点统一到 control。J-Link DLL、ELF 符号解析和 SVD 是内部实现。0.6 调整了工具名与读取请求，升级后需重载 MCP 客户端；迁移见 [迁移说明](docs/MIGRATION.md)。
 
@@ -71,6 +71,20 @@ read 负责观测和记录，control 负责执行状态与断点生命周期；w
 `live` 拒绝 CPU 寄存器读取，即使它当前已暂停；`halted` 要求已经暂停。读取过程中观察到 CPU 恢复运行时丢弃该批暂停快照。暂停 CPU 也不保证 DMA/外设静止。
 
 5. 使用 `control resume` 恢复；结束调用 `session close`。不会因 close 自动恢复运行。断点只列出和清理本会话设置的断点。
+
+## 速率与性能（0.6.1）
+
+`session open` 与项目配置支持 `speed_khz`：`"auto"` 或 5–50000 的整数，单位为 kHz。固定速率必须被探针支持并读回一致；请求前后读回变化会返回 `SPEED_MISMATCH`，不会自动改用低速率。`session status` 的 `connection.data.speed_khz` 返回当前探针读回，`meta.target` 同时保留请求速率和读回速率。软件允许的范围不代表每块目标板都支持该速率。
+
+仓库 c1_driver 配置设为实测通过的 **10000 kHz（10 MHz）**；未指定速率且没有配置时仍为 auto。当前实板在 20 MHz 下连接及 CPUID 读取失败，经用户同意改测 10 MHz，已通过只读基准及完整烧录/断点/故障回归。一次所有速率都无法连接的故障经重新上电恢复，随后通过 6 次连续重连及一分钟持续读取；详见 [验证记录](docs/VALIDATION.md)。
+
+本版缓存有界的 ELF 地址/类型解析计划，目标数据仍每次读取；加快字节转换和匹配镜像比较，类型读取在配置的 RAM/Flash 中选用对齐且不扩展范围的访问宽度。原始内存请求及 SVD 的显式访问宽度保持原义。耗时改用高分辨率计时器，内部 JSON 减少空白。
+
+`scripts/benchmark.py` 可复现主机基准，加 `--serial` 才执行真实 MCP 只读测试，不暂停或写入目标；失败也保存报告。仅软件优化，真实 MCP MotorControl 结构体读取中位数为 13.84 → 5.20 ms（相同 auto 模式，另行探针读回 2 MHz）；再使用 10 MHz 后为 3.38 ms，64 KiB Flash 读取从 418.64 → 108.24 ms。不能把此结果当作 20 MHz 或 MCU 控制环时序证据。
+
+```powershell
+.\.venv\Scripts\python.exe scripts/benchmark.py --elf "C:/Users/32196/Desktop/c1_driver/Firmware_app/MDK-ARM/object/dgm_app_fw.axf" --serial 174504233 --speed-khz 10000 --output .local/benchmark-10m.json
+```
 
 ## 项目配置与带类型的变量读取（0.4）
 
