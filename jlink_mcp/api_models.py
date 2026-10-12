@@ -79,7 +79,8 @@ ReadItem = Annotated[Union[MemoryItem, RegisterItem, PeripheralItem, SymbolItem,
 Items = Annotated[list[ReadItem], Field(min_length=1, max_length=64)]
 
 
-class ReadRequest(Bound):
+class ReadBatch(Bound):
+    action: Literal["read"]
     items: Items
     consistency: Literal["live", "halted"] = "live"
 
@@ -141,11 +142,8 @@ class RunUntilControl(Bound):
         return self
 
 
-ControlRequest = Annotated[Union[RunControl, ResetControl, WaitControl, RunUntilControl], Field(discriminator="action")]
-
-
 class BreakpointAdd(Bound):
-    action: Literal["set"]
+    action: Literal["breakpoint_set"]
     kind: Literal["execute", "read", "write", "access"] = "execute"
     address: Address | None = None
     symbol: Name | None = None
@@ -164,15 +162,16 @@ class BreakpointAdd(Bound):
 
 
 class BreakpointRemove(Bound):
-    action: Literal["remove"]
+    action: Literal["breakpoint_remove"]
     breakpoint_id: Name
 
 
 class BreakpointList(Bound):
-    action: Literal["list"]
+    action: Literal["breakpoint_list"]
 
 
-BreakpointRequest = Annotated[Union[BreakpointAdd, BreakpointRemove, BreakpointList], Field(discriminator="action")]
+ControlRequest = Annotated[Union[RunControl, ResetControl, WaitControl, RunUntilControl,
+                                BreakpointAdd, BreakpointRemove, BreakpointList], Field(discriminator="action")]
 
 
 class InspectFault(Bound):
@@ -215,7 +214,7 @@ class InspectPreflight(Bound):
 InspectRequest = Annotated[Union[InspectFault, InspectContext, InspectSvd, InspectSymbol, InspectVariable, InspectPreflight], Field(discriminator="action")]
 
 
-class Snapshot(ReadRequest):
+class Snapshot(ReadBatch):
     action: Literal["snapshot"]
 
 
@@ -224,7 +223,7 @@ class Diff(Bound):
     snapshot_id: Name
 
 
-class Sample(ReadRequest):
+class Sample(ReadBatch):
     action: Literal["sample"]
     count: Annotated[int, Field(ge=1, le=128)] = 10
     interval_ms: Annotated[int, Field(ge=10, le=1000)] = 100
@@ -237,7 +236,7 @@ class Sample(ReadRequest):
         return self
 
 
-CaptureRequest = Annotated[Union[Snapshot, Diff, Sample], Field(discriminator="action")]
+ReadRequest = Annotated[Union[ReadBatch, Snapshot, Diff, Sample], Field(discriminator="action")]
 
 
 class FirmwareImage(Bound):
@@ -297,3 +296,9 @@ class ChannelState(Bound):
 
 
 ChannelRequest = Annotated[Union[ChannelOpen, ChannelRead, ChannelWrite, ChannelState], Field(discriminator="action")]
+
+
+# The worker and service use the same public request registry.
+TOOL_REQUESTS = {"session": SessionRequest, "read": ReadRequest, "write": WriteRequest,
+                 "control": ControlRequest, "inspect": InspectRequest,
+                 "firmware": FirmwareRequest, "channel": ChannelRequest}

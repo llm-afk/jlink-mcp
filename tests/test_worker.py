@@ -1,5 +1,6 @@
 import sys
 import unittest
+from unittest.mock import patch
 
 from jlink_mcp.worker import DriverWorker
 
@@ -44,3 +45,17 @@ class WorkerTests(unittest.TestCase):
         self.worker.invoke("echo", None)
         self.worker.close()
         self.assertIsNone(self.worker.process)
+
+    def test_worker_entry_unicode_with_legacy_console_encoding(self):
+        command = [sys.executable, "-u", "-c", (
+            "from jlink_mcp import worker_entry; "
+            "worker_entry.service.invoke = lambda *args: "
+            "{'success': True, 'value': '\\u4e2d\\u6587\\u6d4b\\u8bd5\\U0001f680'}; "
+            "worker_entry.main()"
+        )]
+        worker = DriverWorker(command=command)
+        self.addCleanup(worker.close)
+        with patch.dict("os.environ", {"PYTHONIOENCODING": "cp936"}):
+            result = worker.invoke("discover")
+            self.assertTrue(result["success"], result)
+            self.assertEqual(result["value"], "中文测试🚀")

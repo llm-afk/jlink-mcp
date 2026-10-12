@@ -1,5 +1,23 @@
 # 验证记录
 
+## 2026-10-12：0.6.0 接口收敛与实板复验
+
+基于 GitHub main 的 `755a892` 收敛到 8 个工具：capture 的 snapshot/diff/sample 归入 read，breakpoint 的设置/移除/列举归入 control。read 明确 action="read"，断点动作明确 breakpoint_set/remove/list；原有能力、类型边界、会话锁、硬件断点归属和超时策略保留。原生请求模型共用登记表并在子进程启动时缓存解析器。
+
+中文 Windows 首次连接触发 GBK/UTF-8 不一致，返回 BACKEND_LOST。内部 JSON 响应改用 ASCII 转义，回归覆盖 cp936 子进程输出中文和 emoji，能够还原完整 Unicode 数据。
+
+- 最终离线回归 **120 项通过**，包含原有 114 项、Unicode 传输回归和 5 项收敛后契约/路由保护检查。日志：`.local/validation/20261012/final-tests.log`。
+- 真实 MCP stdio 的 tools/list 返回 8 个工具；JSON Schema 检查通过。按相同 JSON 序列化方式，工具定义从 28,621 字节减到 26,005 字节，减少 9.14%；这是字节体积比较，不是 token 计数。
+- 实板配置 GD32C103CB、SWD、J-Link SN 174504233，目标电压 3.3V。新启动服务验证了 8/16/32 位读取一致、工程 preflight、ELF 校验、默认类型读取保护、显式调查模式解码、read snapshot/diff/sample、control breakpoint_list/wait 及连接释放。
+- 证据目录：`.local/validation/profile_20261012_154612/`，含请求/响应、8 工具 schema、源码哈希、采样与日志。CPU 前后 running；DBG_CTL 前后均为 0x00000400；连接已释放。
+- 0.6.0 wheel 已离线构建，并直接从 wheel 导入确认版本与 8 个工具。33 个 Python 文件与工作区逐字节一致，包含 4 份 SVD；SHA256 为 `e5b6f3a69e700fccade1c6f8506f15d0dcd55919069a267a8d65b23fc986ad9c`。产物及校验结果位于 `.local/validation/20261012/dist/`。
+
+本次存在明确的固件证据限制：当前 AXF SHA256 为 `f3e355038dd85ca0b5a123ea9c438030013bfdf49dcc911a68ea7e1a653a27f3`，板上只读镜像比较 38,164 字节，其中 33,770 字节不同，结果 mismatch。默认变量读取正确返回 IMAGE_NOT_MATCHED；显式 require_match=false 仅用于验证解析与原始数据的对应，不能将这些数值解释为当前固件的可信变量。
+
+本地同名 BIN 为 38,360 字节，AXF 的 PT_LOAD 文件载荷为 38,408 字节，二者也不一致。preflight 显示 FWDGT_HOLD=0；本次未执行暂停、单步、断点设置、擦写或故障注入。对应路径与调用已迁移的完整调试脚本仍要求禁用功率输出并验证 AXF/BIN 一致后才能运行。这次没有重新构建或修改 c1_driver。
+
+以下为历史版本验证，工具数量和当时固件哈希仅适用于对应版本。
+
 **历史材料位置：** 以下 0.5 验证目录、固件备份和旧安装包已移入 `.local/workspace-before-cleanup-20260929.zip`；文中的 `hardware_validation/...` 和旧 `dist/...` 是归档内部路径。当前脚本输出到 `.local/validation/`。
 
 0.5 实现约定的前三项优先能力：等待和停止原因、源码/故障现场定位、数据观察点。对外保持 10 个 MCP 工具。类型写入、条件采集、ELF 直接下载和完整 GDB 调用栈未纳入本轮。

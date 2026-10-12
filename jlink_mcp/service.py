@@ -88,13 +88,15 @@ class DebugService:
         self.image_match = {"status": "unknown", "reason": "session or target state changed"}
 
     def invoke(self, method, request=None):
-        # Shared across *all* tools, including read/capture. No overlapping calls
+        # Shared across all tools, including snapshots and sampling. No overlapping calls
         # into the DLL or replacement of a connection during a long operation.
         with self.lock:
             started, timestamp = time.monotonic(), utc_now()
             before = "unknown"
             authorized = False
             try:
+                if method != "discover" and method not in contracts.TOOL_REQUESTS:
+                    raise ServiceError("UNKNOWN_TOOL", "Use a tool from the current tools/list")
                 if isinstance(request, contracts.Bound):
                     self._require(request.session_id, not isinstance(request, contracts.CloseSession))
                 authorized = True
@@ -115,8 +117,9 @@ class DebugService:
         return {"backend": "jlink-dll", "read_kinds": ["memory", "register", "peripheral", "symbol", "variable"],
                 "elf": "32-bit little-endian ET_EXEC; static DWARF globals/members/fixed arrays",
                 "execution_debug": self.target is not None and self.target["architecture"] == "cortex-m",
-                "capture": ["snapshot", "diff", "sample"], "channel": "RTT",
-                "control": ["halt", "resume", "reset", "step", "wait", "run_until"],
+                "read_actions": ["read", "snapshot", "diff", "sample"], "channel": "RTT",
+                "control": ["halt", "resume", "reset", "step", "wait", "run_until",
+                            "breakpoint_set", "breakpoint_remove", "breakpoint_list"],
                 "breakpoint_kinds": ["execute", "read", "write", "access"],
                 "context": "Cortex-M halted registers, stop reasons, ELF source mapping and Thumb disassembly",
                 "unsupported": ["GDB call stack", "source stepping", "arbitrary DWARF expressions and local variables",
@@ -268,6 +271,9 @@ class DebugService:
         return result
 
     def read(self, request):
+        return self._read(request) if request.action == "read" else self._capture(request)
+
+    def _read(self, request):
         if request.consistency == "halted":
             self._halted()
         plans = []
@@ -340,6 +346,8 @@ class DebugService:
             raise ServiceError("UNSUPPORTED_ARCH", "This action requires an explicit cortex-m session profile")
 
     def control(self, request):
+        if isinstance(request, (contracts.BreakpointAdd, contracts.BreakpointRemove, contracts.BreakpointList)):
+            return self._breakpoint(request)
         if request.action == "wait":
             stopped = self._wait_halt(request.timeout_ms)
             return {"success": stopped, "completion": "observed_halted" if stopped else "timeout",
@@ -425,7 +433,7 @@ class DebugService:
         if self.probe.register_read(self._register_name("PC")) & ~1 == address:
             return {"success": True, "completion": "already_at_target", "address": address, "stop": self._stop_context()}
         previous = set(self.breakpoints)
-        bp = self.breakpoint(contracts.BreakpointAdd(action="set", session_id=request.session_id, address=address))
+        bp = self._breakpoint(contracts.BreakpointAdd(action="breakpoint_set", session_id=request.session_id, address=address))
         key = bp["breakpoint_id"]
         result = {"success": False, "address": address, "on_timeout": request.on_timeout}
         try:
@@ -456,12 +464,12 @@ class DebugService:
                 result["reused_breakpoint_id"] = key
         return result
 
-    def breakpoint(self, request):
-        if request.action == "list":
+    def _breakpoint(self, request):
+        if request.action == "breakpoint_list":
             return {"success": True, "breakpoints": copy.deepcopy(self.breakpoints), "scope": "owned by this session"}
         self._cortex_m()
         self._halted()
-        if request.action == "remove":
+        if request.action == "breakpoint_remove":
             self._clear_breakpoint(request.breakpoint_id)
             return {"success": True}
         kind, size, address = request.kind, request.size, request.address
@@ -589,7 +597,7 @@ class DebugService:
         names = ("CFSR", "HFSR", "MMFAR", "BFAR")
         items += [contracts.MemoryItem(kind="memory", address=a, size=4, width=32)
                   for a in (0xE000ED28, 0xE000ED2C, 0xE000ED34, 0xE000ED38)]
-        evidence = self.read(contracts.ReadRequest(session_id=request.session_id, items=items, consistency="halted"))
+        evidence = self._read(contracts.ReadBatch(action="read", session_id=request.session_id, items=items, consistency="halted"))
         faults = {}
         for name, entry in zip(names, evidence["items"][len(reg_names):]):
             if entry["success"]:
@@ -612,12 +620,12 @@ class DebugService:
                                    "bfar_valid": bool(cfsr & (1 << 15)) if cfsr is not None else None,
                                    "note": "Sticky fault status is evidence, not proof of a current root cause"}}
 
-    def capture(self, request):
+    def _capture(self, request):
         if request.action == "diff":
             saved = self.snapshots.get(request.snapshot_id)
             if saved is None or saved["generation"] != self.generation:
                 raise ServiceError("STALE_SNAPSHOT", "Snapshot expired after reset, flash, reconnect, or eviction")
-            current = self.read(saved["request"])
+            current = self._read(saved["request"])
             changes = []
             for index, (old, new) in enumerate(zip(saved["result"]["items"], current["items"])):
                 if not old["success"] or not new["success"]:
@@ -626,9 +634,9 @@ class DebugService:
                     changes.append({"index": index, "status": "changed", "before": old["data"], "after": new["data"]})
             return {"success": saved["result"]["success"] and current["success"], "changes": changes,
                     "snapshot_timestamp": saved["timestamp"], "current": current}
-        reading = contracts.ReadRequest(session_id=request.session_id, items=request.items, consistency=request.consistency)
+        reading = contracts.ReadBatch(action="read", session_id=request.session_id, items=request.items, consistency=request.consistency)
         if request.action == "snapshot":
-            result = self.read(reading)
+            result = self._read(reading)
             key = uuid.uuid4().hex
             if len(self.snapshots) >= 16:
                 del self.snapshots[next(iter(self.snapshots))]
@@ -649,7 +657,7 @@ class DebugService:
                     time.sleep(delay)
                 if time.monotonic() - started > 10:
                     break
-                result = self.read(reading)
+                result = self._read(reading)
                 stream.write(json.dumps({"index": index, "timestamp": utc_now(), "session_id": self.session_id,
                                          "target": self.target, "generation": self.generation,
                                          "host_elapsed_ms": (time.monotonic() - started) * 1000, "result": result}) + "\n")

@@ -156,7 +156,7 @@ class OptimizationTests(unittest.TestCase):
         s = self.service()
         s.probe.memory_read.return_value = list(struct.pack('<I', 42))
         def read(**kwargs):
-            return s.read(m.ReadRequest(session_id='test', items=[dict(kind='variable', name='counter', **kwargs)]))
+            return s.read(m.ReadBatch(action="read", session_id='test', items=[dict(kind='variable', name='counter', **kwargs)]))
         blocked = read()
         self.assertEqual(blocked['items'][0]['error']['code'], 'IMAGE_NOT_MATCHED')
         s.probe.memory_read.assert_not_called()

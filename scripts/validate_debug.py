@@ -56,7 +56,7 @@ async def validate(args):
             async with ClientSession(reader, writer) as client:
                 await client.initialize()
                 listed = (await client.list_tools()).tools
-                assert len(listed) == 10
+                assert len(listed) == 8
                 (output / 'tools.json').write_text(json.dumps([t.model_dump() for t in listed], indent=2), encoding='utf-8')
                 async def call(tool, request=None, ok=True):
                     nonlocal sid
@@ -76,7 +76,7 @@ async def validate(args):
                                                        elf_path=str(elf), serial_number=args.serial))
                     return result['session_id']
                 async def raw(address, size):
-                    result = await target('read', items=[dict(kind='memory', address=address, size=size, width=32)])
+                    result = await target('read', action='read', items=[dict(kind='memory', address=address, size=size, width=32)])
                     return bytes.fromhex(result['items'][0]['data']['data_hex'])
                 async def dbg(value):
                     await target('write', consistency='live', verify=True,
@@ -121,13 +121,13 @@ async def validate(args):
                     loop = await target('control', action='run_until', symbol='servo_loop', timeout_ms=3000)
                     assert loop['completion'] == 'target_reached'
                     await target('inspect', action='context')
-                    wp = await target('breakpoint', action='set', kind='write', variable='MotorControl.BusVoltage')
+                    wp = await target('control', action='breakpoint_set', kind='write', variable='MotorControl.BusVoltage')
                     await target('control', action='resume')
                     stopped = await target('control', action='wait', timeout_ms=1000)
                     assert any(r['name'] == 'data_watchpoint' for r in stopped['stop']['reasons'])
                     context = await target('inspect', action='context')
                     assert context['locations']['PC']['sources']
-                    await target('breakpoint', action='remove', breakpoint_id=wp['breakpoint_id'])
+                    await target('control', action='breakpoint_remove', breakpoint_id=wp['breakpoint_id'])
                     for policy in ('halt', 'running'):
                         result = await target('control', action='run_until', symbol='HardFault_Handler', timeout_ms=30, on_timeout=policy, ok=False)
                         assert result['completion'] == 'timeout' and result['temporary_breakpoint_removed']
@@ -143,7 +143,7 @@ async def validate(args):
                     scratch_backup = await raw(scratch, 4)
                     await target('write', verify=True, item=dict(kind='memory', address=scratch, width=32, data_hex='00de00bf'))
                     await target('firmware', action='verify_image')
-                    bp = await target('breakpoint', action='set', symbol='HardFault_Handler')
+                    bp = await target('control', action='breakpoint_set', symbol='HardFault_Handler')
                     await target('write', verify=True, item=dict(kind='register', name='PC', value=scratch))
                     await target('firmware', action='verify_image')
                     await target('control', action='resume')

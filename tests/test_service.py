@@ -35,7 +35,7 @@ class ServiceTests(unittest.TestCase):
         self.gdb.is_running = False
 
     def read(self, items=None, **kwargs):
-        return self.s.invoke("read", m.ReadRequest(session_id="test", items=items or [
+        return self.s.invoke("read", m.ReadBatch(action="read", session_id="test", items=items or [
             {"kind": "memory", "address": 0x20000000, "size": 4}], **kwargs))
 
     def test_live_memory_never_halts(self):
@@ -137,9 +137,39 @@ class ServiceTests(unittest.TestCase):
     def test_failed_breakpoint_clear_keeps_ownership(self):
         self.s.breakpoints["b"] = {"handle": 1, "address": 0x08000000}
         self.probe.breakpoint_clear.return_value = False
-        result = self.s.invoke("breakpoint", m.BreakpointRemove(session_id="test", action="remove", breakpoint_id="b"))
+        result = self.s.invoke("control", m.BreakpointRemove(session_id="test", action="breakpoint_remove", breakpoint_id="b"))
         self.assertFalse(result["success"])
         self.assertIn("b", self.s.breakpoints)
+
+    def test_control_lists_only_owned_breakpoints_while_running(self):
+        self.probe.halted.return_value = False
+        self.s.breakpoints["owned"] = {"handle": 3, "address": 0x08000100}
+        result = self.s.invoke("control", m.BreakpointList(session_id="test", action="breakpoint_list"))
+        self.assertTrue(result["success"])
+        self.assertEqual(set(result["breakpoints"]), {"owned"})
+        self.assertEqual(result["meta"]["cpu_after"], "running")
+        self.probe.halt.assert_not_called()
+        self.probe.breakpoint_find.assert_not_called()
+
+    def test_removed_tool_names_never_access_probe(self):
+        requests = {"capture": m.Snapshot(session_id="test", action="snapshot", items=[
+            {"kind": "memory", "address": 0, "size": 4}]),
+            "breakpoint": m.BreakpointList(session_id="test", action="breakpoint_list")}
+        for name, request in requests.items():
+            with self.subTest(tool=name):
+                result = self.s.invoke(name, request)
+                self.assertEqual(result["error"]["code"], "UNKNOWN_TOOL")
+        self.manager.get_jlink.assert_not_called()
+        self.probe.memory_read.assert_not_called()
+        self.probe.halted.assert_not_called()
+
+    def test_merged_breakpoint_set_still_requires_halt(self):
+        self.probe.halted.return_value = False
+        result = self.s.invoke("control", m.BreakpointAdd(
+            session_id="test", action="breakpoint_set", address=0x08000100))
+        self.assertEqual(result["error"]["code"], "REQUIRES_HALT")
+        self.probe.hardware_breakpoint_set.assert_not_called()
+        self.probe.halt.assert_not_called()
 
     def test_open_checks_target_and_creates_new_identity(self):
         self.s.session_id = self.s.probe = self.s.target = None
@@ -182,25 +212,25 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse(self.s.snapshots)
 
     def test_snapshot_diff_and_invalidation(self):
-        snapshot = self.s.invoke("capture", m.Snapshot(session_id="test", action="snapshot", items=[
+        snapshot = self.s.invoke("read", m.Snapshot(session_id="test", action="snapshot", items=[
             {"kind": "memory", "address": 0, "size": 4}]))
         self.probe.memory_read.return_value = [4, 3, 2, 1]
         req = m.Diff(session_id="test", action="diff", snapshot_id=snapshot["snapshot_id"])
-        self.assertEqual(len(self.s.invoke("capture", req)["changes"]), 1)
+        self.assertEqual(len(self.s.invoke("read", req)["changes"]), 1)
         self.s._invalidate()
-        self.assertEqual(self.s.invoke("capture", req)["error"]["code"], "STALE_SNAPSHOT")
+        self.assertEqual(self.s.invoke("read", req)["error"]["code"], "STALE_SNAPSHOT")
 
     def test_samples_write_evidence_and_refuse_overwrite(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "samples.jsonl"
             req = m.Sample(session_id="test", action="sample", count=2, interval_ms=10,
                            output_path=str(path), items=[{"kind": "memory", "address": 0, "size": 4}])
-            result = self.s.invoke("capture", req)
+            result = self.s.invoke("read", req)
             self.assertTrue(result["success"])
             lines = [json.loads(line) for line in path.read_text().splitlines()]
             self.assertEqual(len(lines), 2)
             self.assertEqual(lines[0]["session_id"], "test")
-            self.assertFalse(self.s.invoke("capture", req)["success"])
+            self.assertFalse(self.s.invoke("read", req)["success"])
             self.assertEqual(len(path.read_text().splitlines()), 2)
 
     def test_backup_never_overwrites(self):
@@ -254,11 +284,11 @@ class ServiceTests(unittest.TestCase):
 
     def test_breakpoints_owned_and_deduplicated(self):
         self.probe.hardware_breakpoint_set.return_value = 3
-        req = m.BreakpointAdd(session_id="test", action="set", address=0x8000101)
-        a, b = self.s.invoke("breakpoint", req), self.s.invoke("breakpoint", req)
+        req = m.BreakpointAdd(session_id="test", action="breakpoint_set", address=0x8000101)
+        a, b = self.s.invoke("control", req), self.s.invoke("control", req)
         self.assertEqual(a["breakpoint_id"], b["breakpoint_id"])
         self.probe.hardware_breakpoint_set.assert_called_once_with(0x8000100, thumb=True)
-        result = self.s.invoke("breakpoint", m.BreakpointRemove(session_id="test", action="remove", breakpoint_id=a["breakpoint_id"]))
+        result = self.s.invoke("control", m.BreakpointRemove(session_id="test", action="breakpoint_remove", breakpoint_id=a["breakpoint_id"]))
         self.assertTrue(result["success"])
         self.probe.breakpoint_clear.assert_called_once_with(3)
 
@@ -282,6 +312,32 @@ class ServiceTests(unittest.TestCase):
 
 
 class SchemaTests(unittest.TestCase):
+    def test_read_actions_require_explicit_and_action_specific_fields(self):
+        valid = [dict(action="read", items=[dict(kind="memory", address=0, size=4)]),
+                 dict(action="snapshot", items=[dict(kind="memory", address=0, size=4)]),
+                 dict(action="diff", snapshot_id="snapshot"),
+                 dict(action="sample", items=[dict(kind="memory", address=0, size=4)], count=2)]
+        adapter = TypeAdapter(m.ReadRequest)
+        for request in valid:
+            with self.subTest(request=request):
+                parsed = adapter.validate_python(dict(session_id="s", **request))
+                self.assertEqual(parsed.action, request["action"])
+        invalid = [dict(items=[dict(kind="memory", address=0, size=4)]),
+                   dict(action="read", items=[], snapshot_id="snapshot"),
+                   dict(action="diff", snapshot_id="snapshot", items=[]),
+                   dict(action="sample", items=[dict(kind="memory", address=0, size=4)], on_timeout="halt")]
+        for request in invalid:
+            with self.subTest(request=request), self.assertRaises(ValidationError):
+                adapter.validate_python(dict(session_id="s", **request))
+
+    def test_control_rejects_unqualified_breakpoint_actions(self):
+        adapter = TypeAdapter(m.ControlRequest)
+        for request in (dict(action="set", address=0x08000100), dict(action="list"),
+                        dict(action="breakpoint_list", address=0x08000100),
+                        dict(action="breakpoint_remove", breakpoint_id="b", kind="execute")):
+            with self.subTest(request=request), self.assertRaises(ValidationError):
+                adapter.validate_python(dict(session_id="s", **request))
+
     def test_invalid_actions_and_unused_options_are_rejected(self):
         for value in ({"session_id": "s", "action": "run_until"},
                       {"session_id": "s", "action": "resume", "reset": True}):
@@ -292,11 +348,12 @@ class SchemaTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             m.Sample(action="sample", session_id="s", items=[{"kind": "register", "name": "PC"}], count=128, interval_ms=1000)
 
-    def test_exactly_ten_tools_and_valid_schemas(self):
+    def test_exactly_eight_tools_and_valid_schemas(self):
         from jlink_mcp.server import mcp
         tools = asyncio.run(mcp.list_tools())
         self.assertEqual({t.name for t in tools}, {"discover", "session", "read", "write", "control",
-                         "breakpoint", "inspect", "capture", "firmware", "channel"})
+                         "inspect", "firmware", "channel"})
+        self.assertEqual({t.name for t in tools}, {"discover", *m.TOOL_REQUESTS})
         import jsonschema
         for tool in tools:
             jsonschema.Draft202012Validator.check_schema(tool.inputSchema)
@@ -307,7 +364,7 @@ class SchemaTests(unittest.TestCase):
         self.addCleanup(worker.close)
         async def run():
             # The request is rejected before any actual probe access.
-            return await mcp.call_tool("read", {"request": {"session_id": "stale", "items": [
+            return await mcp.call_tool("read", {"request": {"session_id": "stale", "action": "read", "items": [
                 {"kind": "memory", "address": 0, "size": 4}]}})
         response = asyncio.run(run())
         content = response[0] if isinstance(response, tuple) else response

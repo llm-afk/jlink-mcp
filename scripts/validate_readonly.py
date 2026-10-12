@@ -31,7 +31,7 @@ async def validate(serial):
             async with ClientSession(reader, writer) as client:
                 await client.initialize()
                 tools = (await client.list_tools()).tools
-                assert len(tools) == 10
+                assert len(tools) == 8
                 (output / 'tools.json').write_text(json.dumps([t.model_dump() for t in tools], indent=2), encoding='utf-8')
                 async def call(tool, request=None, require_success=True):
                     response = await client.call_tool(tool, {'request': request} if request is not None else {})
@@ -50,29 +50,38 @@ async def validate(serial):
                     state = initial['meta']['cpu_after']
                     assert state == 'running', initial
                     preflight = await call('inspect', dict(session_id=sid, action='preflight'))
+                    widths = await call('read', dict(session_id=sid, action='read', items=[
+                        dict(kind='memory', address=0x08000000, size=32, width=width) for width in (8, 16, 32)]))
+                    assert len({entry['data']['data_hex'] for entry in widths['items']}) == 1
                     match = await call('firmware', dict(session_id=sid, action='verify_image'), False)
                     assert match['status'] in ('matched', 'mismatch', 'partial'), match
                     for name in ('state_mcs', 'MotorControl', 'MotorControl.Iq', 'MotorControl.PID_Iq.kp'):
                         await call('inspect', dict(session_id=sid, action='variable', name=name))
                     matched = match['status'] == 'matched'
                     if not matched:
-                        blocked = await call('read', dict(session_id=sid, items=[dict(kind='variable', name='state_mcs')]), False)
+                        blocked = await call('read', dict(session_id=sid, action='read', items=[dict(kind='variable', name='state_mcs')]), False)
                         assert blocked['items'][0]['error']['code'] == 'IMAGE_NOT_MATCHED'
                     items = [dict(kind='variable', name=name, require_match=matched)
                              for name in ('state_mcs', 'MotorControl', 'MotorControl.Iq', 'MotorControl.PID_Iq.kp')]
-                    result = await call('read', dict(session_id=sid, consistency='live', items=items))
+                    result = await call('read', dict(session_id=sid, action='read', consistency='live', items=items))
                     from jlink_mcp.dwarf_variables import decode
                     for entry in result['items']:
                         data = entry['data']
                         assert decode(data['type'], bytes.fromhex(data['data_hex'])) == data['value']
                         assert data['elf_match'] == match['status']
-                    snap = await call('capture', dict(session_id=sid, action='snapshot', items=items))
-                    await call('capture', dict(session_id=sid, action='diff', snapshot_id=snap['snapshot_id']))
+                    snap = await call('read', dict(session_id=sid, action='snapshot', items=items))
+                    await call('read', dict(session_id=sid, action='diff', snapshot_id=snap['snapshot_id']))
+                    await call('read', dict(session_id=sid, action='sample', items=items, count=3, interval_ms=10,
+                                            output_path=str(output / 'samples.jsonl')))
+                    listed = await call('control', dict(session_id=sid, action='breakpoint_list'))
+                    assert listed['breakpoints'] == {}
+                    waited = await call('control', dict(session_id=sid, action='wait', timeout_ms=10), False)
+                    assert waited['completion'] == 'timeout' and waited['meta']['cpu_after'] == state
                     final = await call('session', dict(action='status'))
                     assert final['meta']['cpu_after'] == state
                     after = await call('inspect', dict(session_id=sid, action='preflight'))
                     assert [c['value'] for c in preflight['checks']] == [c['value'] for c in after['checks']]
-                    trace.append(dict(check='read-only profile/image/typed read/snapshot validation', passed=True,
+                    trace.append(dict(check='read-only widths/profile/image/typed read/snapshot/sample/control validation', passed=True,
                                       cpu_before=state, cpu_after=final['meta']['cpu_after'], image_status=match['status']))
                     save()
                 finally:

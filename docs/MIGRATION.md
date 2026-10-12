@@ -1,5 +1,35 @@
 # 迁移到精简接口
 
+## 0.5.1 → 0.6.0：八个工具
+
+当前工具为 discover、session、read、write、control、inspect、firmware、channel。
+capture 合入 read，breakpoint 合入 control；所有原有能力保留。升级后须重载 MCP 服务并刷新 tools/list。
+
+| 原请求 | 0.6 请求 |
+|---|---|
+| read，未指定 action | read，增加 action="read" |
+| capture action="snapshot"/"diff"/"sample" | read，action 与其余字段保持不变 |
+| breakpoint action="set" | control action="breakpoint_set" |
+| breakpoint action="remove" | control action="breakpoint_remove" |
+| breakpoint action="list" | control action="breakpoint_list" |
+
+session_id、items、consistency、snapshot_id、breakpoint_id、位置/类型字段及匹配要求保持原义。
+不同 action 的字段仍严格区分，例如 diff 不接受 items，breakpoint_list 不接受 address；未指定 read action 的请求在访问探针前被拒绝。
+旧 capture/breakpoint 工具名不再注册。两个原生后端子任务变为私有实现，驱动、会话锁、快照失效、断点归属及超时策略继续复用。
+write、firmware 与 RTT channel 保留独立接口；inspect 提供元信息与现场解析，read 负责获取和记录数据。
+
+```json
+{"request":{"session_id":"当前ID","action":"read","items":[{"kind":"memory","address":536870912,"size":16}]}}
+{"request":{"session_id":"当前ID","action":"snapshot","items":[{"kind":"memory","address":536870912,"size":16}]}}
+{"request":{"session_id":"当前ID","action":"breakpoint_set","kind":"write","address":536870912,"size":4}}
+{"request":{"session_id":"当前ID","action":"breakpoint_list"}}
+```
+
+前两个请求发给 read，后两个发给 control。设置/删除断点依然要求暂停；列举本会话断点不改变 CPU 状态。
+中文 Windows 上内部 JSON 响应改用 ASCII 转义，中文和其他 Unicode 内容仍按 JSON 正确还原，避免 GBK/UTF-8 编码不一致导致 BACKEND_LOST。
+
+## 历史版本迁移
+
 0.3 将原 44 个 MCP 工具收敛为 10 个；旧名不注册。旧验证脚本和历史材料已归档，不再作为当前项目入口；对外兼容契约为 MCP 工具 schema，私有 Python 模块不保证旧导出兼容。
 
 每个新工具除 discover 外接收 `{"request": {...}}`，目标操作携带 `session_id`。应先读取客户端最新 tools/list，不能继续使用缓存的旧 schema。

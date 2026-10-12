@@ -7,10 +7,7 @@ from pydantic import TypeAdapter
 from . import api_models as m
 from .service import service, error_result
 
-REQUESTS = {"session": m.SessionRequest, "read": m.ReadRequest, "write": m.WriteRequest,
-            "control": m.ControlRequest, "breakpoint": m.BreakpointRequest,
-            "inspect": m.InspectRequest, "capture": m.CaptureRequest,
-            "firmware": m.FirmwareRequest, "channel": m.ChannelRequest}
+REQUEST_ADAPTERS = {name: TypeAdapter(model) for name, model in m.TOOL_REQUESTS.items()}
 
 
 def main():
@@ -24,11 +21,12 @@ def main():
             elif method == "discover":
                 result = service.invoke("discover")
             else:
-                request = TypeAdapter(REQUESTS[method]).validate_python(message["request"])
+                request = REQUEST_ADAPTERS[method].validate_python(message["request"])
                 result = service.invoke(method, request)
         except Exception as exc:
             result = error_result(exc)
-        sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+        # ASCII escapes keep the JSON pipe compatible with Windows console encodings.
+        sys.stdout.write(json.dumps(result, ensure_ascii=True) + "\n")
         sys.stdout.flush()
         if method == "_close":
             return

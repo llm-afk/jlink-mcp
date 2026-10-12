@@ -68,7 +68,7 @@ class DriverWorker:
     def deadline(method, request):
         if method == "firmware":
             return 120.0
-        if method == "capture":
+        if method == "control" and getattr(request, "action", "").startswith("breakpoint_"):
             return 20.0
         if method in ("control", "channel"):
             return max(10.0, getattr(request, "timeout_ms", 1000) / 1000 + 5.0)

@@ -1,6 +1,6 @@
-# J-Link MCP 0.5.1
+# J-Link MCP 0.6.0
 
-面向嵌入式调试任务的 MCP 服务。对外只提供 **10 个工具**；J-Link DLL、ELF 符号解析和 SVD 是内部实现。0.3 是破坏性 API 更新，旧工具名不再注册，迁移见 [迁移说明](docs/MIGRATION.md)。
+面向嵌入式调试任务的 MCP 服务。对外提供 **8 个工具**：读取与采集统一到 read，执行控制与断点统一到 control。J-Link DLL、ELF 符号解析和 SVD 是内部实现。0.6 调整了工具名与读取请求，升级后需重载 MCP 客户端；迁移见 [迁移说明](docs/MIGRATION.md)。
 
 ## 安装与启动
 
@@ -18,7 +18,7 @@ py -m venv .venv
 
 SDK 固定兼容范围 `mcp>=1.26.0,<2`；MCP 2.x 更改了 FastMCP API。ELF 符号解析使用 pyelftools，不要求 GDB。
 
-## 十个接口
+## 八个接口
 
 除 discover 外，各工具参数统一放在 `request` 对象中。操作相关字段由严格的 action/kind 联合模型约束，多余参数被拒绝，不会静默忽略。
 
@@ -26,16 +26,16 @@ SDK 固定兼容范围 `mcp>=1.26.0,<2`；MCP 2.x 更改了 FastMCP API。ELF �
 |---|---|
 | discover | 枚举探针、可用 SVD、能力边界，不连接目标 |
 | session | open / status / close |
-| read | 批量 memory / register / peripheral / symbol / variable |
+| read | read / snapshot / diff / sample；支持 memory / register / peripheral / symbol / variable |
 | write | 单次 memory / register / peripheral 写入，可显式校验 |
-| control | halt / resume / reset / step（指令级）/ wait / run_until |
-| breakpoint | set / list / remove，执行断点及读/写/访问观察点 |
+| control | halt / resume / reset / step / wait / run_until / breakpoint_set / breakpoint_remove / breakpoint_list |
 | inspect | symbol / variable / preflight / svd / context / fault |
-| capture | snapshot / diff / sample |
 | firmware | verify_image / program / verify / backup / erase_pages / erase_chip |
 | channel | RTT open / status / read / write / close |
 
 使用提示是 `debug://guide` 资源，不占工具列表。
+
+read 负责观测和记录，control 负责执行状态与断点生命周期；write、firmware 和 RTT channel 各自保留独立入口。read 必须明确 action，断点动作使用 breakpoint_ 前缀；每种 action 仍有独立的严格字段模型。
 
 ## 基本流程
 
@@ -51,7 +51,7 @@ SDK 固定兼容范围 `mcp>=1.26.0,<2`；MCP 2.x 更改了 FastMCP API。ELF �
 3. 运行中读取，不自动暂停：
 
 ```json
-{"request":{"session_id":"返回的ID","consistency":"live","items":[{"kind":"memory","address":536870912,"size":16,"width":32},{"kind":"symbol","name":"g_state"}]}}
+{"request":{"session_id":"返回的ID","action":"read","consistency":"live","items":[{"kind":"memory","address":536870912,"size":16,"width":32},{"kind":"symbol","name":"g_state"}]}}
 ```
 
 `symbol` 只读取 ELF 中有明确地址和大小的对象原始字节；`g_state` 为示意符号，不保证存在于实际固件。需要 DWARF 类型和结构体成员时使用下面的 `variable`。ELF 的 SHA256 仅标识本地文件，初始 `target_match=unknown`；运行 `firmware verify_image` 才生成匹配证据。
@@ -65,7 +65,7 @@ SDK 固定兼容范围 `mcp>=1.26.0,<2`；MCP 2.x 更改了 FastMCP API。ELF �
 再调用 `read`：
 
 ```json
-{"request":{"session_id":"返回的ID","consistency":"halted","items":[{"kind":"register","name":"PC"},{"kind":"register","name":"SP"}]}}
+{"request":{"session_id":"返回的ID","action":"read","consistency":"halted","items":[{"kind":"register","name":"PC"},{"kind":"register","name":"SP"}]}}
 ```
 
 `live` 拒绝 CPU 寄存器读取，即使它当前已暂停；`halted` 要求已经暂停。读取过程中观察到 CPU 恢复运行时丢弃该批暂停快照。暂停 CPU 也不保证 DMA/外设静止。
@@ -88,14 +88,14 @@ SDK 固定兼容范围 `mcp>=1.26.0,<2`；MCP 2.x 更改了 FastMCP API。ELF �
 
 ```json
 {"request":{"session_id":"返回的ID","action":"variable","name":"MotorControl.PID_Iq.kp"}}
-{"request":{"session_id":"返回的ID","consistency":"live","items":[{"kind":"variable","name":"state_mcs"},{"kind":"variable","name":"MotorControl.Iq"},{"kind":"variable","name":"MotorControl"}]}}
+{"request":{"session_id":"返回的ID","action":"read","consistency":"live","items":[{"kind":"variable","name":"state_mcs"},{"kind":"variable","name":"MotorControl.Iq"},{"kind":"variable","name":"MotorControl"}]}}
 ```
 
 分别发给 `inspect`、`read`。`inspect variable` 只解析地址和类型；`read variable` 默认要求本会话已有 matched 证据。显式 `require_match=false` 可进行不匹配调查，结果仍标记实际 elf_match，不能据此确认变量语义。所有类型读取必须落在配置的 RAM/Flash 内；配置不是通用写入访问控制表。
 
 支持具有固定地址的全局变量、嵌套结构体、连续定长数组、整数、浮点、布尔和枚举。`global.member[index]` 是唯一选择语法；指针只显示地址，不解引用。拒绝局部变量、动态位置、函数调用、位域、联合体、动态/跨步数组等未支持类型。单对象最大 64KB，数组最多 4096 元素，类型深度最多 16，解码值树最多 8192 节点。返回值同时保留原始字节；NaN/Infinity 用字符串表达，保持合法 JSON。
 
-`capture` 直接复用 variable，无新增工具。运行中的多变量或结构体读取不保证一致时刻。显式写入、复位、Flash 修改尝试和连接失效会清除映像匹配证据；外部工具或目标自行改写 Flash 无法自动检测，必要时重新 verify_image。
+read 的 snapshot/sample 直接复用 variable。运行中的多变量或结构体读取不保证一致时刻。显式写入、复位、Flash 修改尝试和连接失效会清除映像匹配证据；外部工具或目标自行改写 Flash 无法自动检测，必要时重新 verify_image。
 
 ## 等待、现场定位和数据观察点（0.5）
 
@@ -111,14 +111,14 @@ SDK 固定兼容范围 `mcp>=1.26.0,<2`；MCP 2.x 更改了 FastMCP API。ELF �
 分别发给 control 和 inspect。`context` 要求暂停，给出 PC/LR 对应的 ELF 函数、源码路径/行号，并从目标实际字节反汇编；可选 address 指定反汇编起点，instructions=0 可跳过。最多 32 条，读取限定在项目内存或 ELF 可执行区。源码路径来自 DWARF，不代表源码文件内容已验证；映射始终携带 ELF 匹配状态，不将不匹配映射当成事实。停机原因的 unit_index=-1 表示驱动没有报告单元索引。
 
 ```json
-{"request":{"session_id":"返回的ID","action":"set","kind":"write","variable":"MotorControl.BusVoltage"}}
+{"request":{"session_id":"返回的ID","action":"breakpoint_set","kind":"write","variable":"MotorControl.BusVoltage"}}
 {"request":{"session_id":"返回的ID","action":"resume"}}
 {"request":{"session_id":"返回的ID","action":"wait","timeout_ms":1000}}
 ```
 
-分别发给 breakpoint、control、control。breakpoint 的 kind 支持 execute/read/write/access；execute 为默认值。数据观察点接收 variable 或 address+size；宽度为 1/2/4 字节且要求对齐，匹配对应访问宽度，不解引用指针，也不支持任意值条件。观察点数量取决于硬件资源，分配失败明确返回错误。硬件报告的停止 PC 可能已位于触发访问之后；不能直接把当前行当成写入行。
+三个请求均发给 control。breakpoint_set 的 kind 支持 execute/read/write/access；execute 为默认值。数据观察点接收 variable 或 address+size；宽度为 1/2/4 字节且要求对齐，匹配对应访问宽度，不解引用指针，也不支持任意值条件。观察点数量取决于硬件资源，分配失败明确返回错误。硬件报告的停止 PC 可能已位于触发访问之后；不能直接把当前行当成写入行。
 
-所有执行断点均使用硬件，不回退软件 Flash 断点。符号执行断点和变量观察点要求本会话有 matched 证据；调查不匹配镜像时可显式使用地址。set/remove 仍要求暂停，reset/close 清理本会话持有的两类断点。resume 后若已经命中断点，返回 observed_halted 和 running_observed=false，避免将快速命中误报为超时。
+所有执行断点均使用硬件，不回退软件 Flash 断点。符号执行断点和变量观察点要求本会话有 matched 证据；调查不匹配镜像时可显式使用地址。breakpoint_set/remove 仍要求暂停，breakpoint_list 可在运行中查看本会话拥有的断点；reset/close 清理这两类断点。resume 后若已经命中断点，返回 observed_halted 和 running_observed=false，避免将快速命中误报为超时。
 
 `inspect fault` 新增具名 CFSR/HFSR 标志和 exception_frame。仅对 ARMv7-M 的有效 EXC_RETURN 解析一层异常帧，支持 MSP/PSP、基本/扩展浮点栈布局和对齐填充，保留核心寄存器原始字节。自动恢复要求停在向量表指向的异常入口；执行过处理函数后 SP 可能已移动，须同时提供明确的 frame_address 和 exc_return。帧必须落在配置 RAM 中；堆栈错误或字段无效时返回 unavailable/invalid。浮点载荷不解码，也不将异常帧冒充完整调用栈。
 
@@ -128,16 +128,24 @@ SDK 固定兼容范围 `mcp>=1.26.0,<2`；MCP 2.x 更改了 FastMCP API。ELF �
 - 内存读取不会主动暂停；SVD 读取对已解析的 `readAction` 默认拒绝，需显式 `allow_side_effects=true`。SVD 不是完整访问策略：其继承、厂商扩展及遗漏不能作为无副作用证明。
 - `write` 默认要求暂停，但不主动暂停；默认不读回，`verify=true` 才执行读回。外设读回可能有副作用或因 W1C、自清零、硬件并发变化而不等于写入值。
 - 写入、运行控制等命令遇到异常不自动重试。返回失败时，尤其超时，不能据此推断目标没有发生变化。
-- J-Link DLL 在独立子进程中运行。普通操作最多等待 20 秒，control/channel 至少 10 秒或请求等待时间加 5 秒，firmware 120 秒；超时终止本服务拥有的驱动进程树，返回 BACKEND_TIMEOUT、session_lost=true、completion=unknown。MCP 服务继续存活，必须显式重新打开会话，不能重发未知结果的写入。
+- J-Link DLL 在独立子进程中运行。普通操作及断点管理最多等待 20 秒，其他 control/channel 至少 10 秒或请求等待时间加 5 秒，firmware 120 秒；超时终止本服务拥有的驱动进程树，返回 BACKEND_TIMEOUT、session_lost=true、completion=unknown。MCP 服务继续存活，必须显式重新打开会话，不能重发未知结果的写入。内部 JSON 传输使用 ASCII 转义，兼容中文 Windows 的默认控制台编码。
 - `control` 返回观测到的运行/暂停状态或 timeout；不会通过自动复位解决暂停失败。`step`、`run_until` 和硬件断点要求明确配置为 Cortex-M 的会话。
 - `inspect fault` 读取并核对 CPUID，当前只支持 Cortex-M3/M4/M7。保留原始证据和逐项错误，不把 sticky fault 位当成当前根因。
 - 每个结果含会话、目标、generation、UTC 时间、耗时、操作前后 CPU 状态。批量读取不是原子快照。
 
 ## 快照与有限采样
 
-`capture snapshot` 使用与 `read` 相同的 items/consistency，返回 snapshot_id。`capture diff` 将该快照与现在比较；原快照保持不变。最多保留 16 个，超出淘汰最早项。
+`read snapshot` 使用与 `read read` 相同的 items/consistency，返回 snapshot_id。`read diff` 将该快照与现在比较；原快照保持不变。最多保留 16 个，超出淘汰最早项。
 
-`capture sample` 使用相同 items，外加 `count`、`interval_ms`、可选 `output_path`。最多 128 次、1MiB 原始载荷和 10 秒请求窗口；单次底层驱动阻塞可能延长实际时长。默认文件在当前目录 `captures/`，JSONL 含原始结果、会话及主机时间，不覆盖已有文件。主机时间不是 MCU 精确采样时间，不能用于声称验证了高速电流环时序。
+`read sample` 使用相同 items，外加 `count`、`interval_ms`、可选 `output_path`。最多 128 次、1MiB 原始载荷和 10 秒请求窗口；单次底层驱动阻塞可能延长实际时长。默认文件在当前目录 `captures/`，JSONL 含原始结果、会话及主机时间，不覆盖已有文件。主机时间不是 MCU 精确采样时间，不能用于声称验证了高速电流环时序。
+
+以下三个请求均发给 read；diff 只接收 session_id/action/snapshot_id，不重复传 items：
+
+```json
+{"request":{"session_id":"返回的ID","action":"snapshot","items":[{"kind":"memory","address":536870912,"size":16}]}}
+{"request":{"session_id":"返回的ID","action":"diff","snapshot_id":"快照返回的ID"}}
+{"request":{"session_id":"返回的ID","action":"sample","items":[{"kind":"memory","address":536870912,"size":16}],"count":3,"interval_ms":100}}
+```
 
 复位、固件修改尝试、断开/重连会使旧快照失效。固件修改失败也失效，因为可能已部分写入。
 

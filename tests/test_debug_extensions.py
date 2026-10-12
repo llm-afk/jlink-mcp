@@ -78,7 +78,7 @@ class DebugExtensionTests(unittest.TestCase):
         self.p.hardware_breakpoint_set.assert_not_called()
 
     def test_until_reuses_user_breakpoint(self):
-        self.s.breakpoint(m.BreakpointAdd(session_id='s', action='set', address=0x08000200))
+        self.s.control(m.BreakpointAdd(session_id='s', action='breakpoint_set', address=0x08000200))
         result = self.until()
         self.assertIn(result['reused_breakpoint_id'], self.s.breakpoints)
         self.p.breakpoint_clear.assert_not_called()
@@ -110,25 +110,25 @@ class DebugExtensionTests(unittest.TestCase):
     def test_data_watchpoint_access_and_cleanup(self):
         for kind, rd, wr in [('read', True, False), ('write', False, True), ('access', True, True)]:
             with self.subTest(kind=kind):
-                result = self.s.breakpoint(m.BreakpointAdd(session_id='s', action='set', kind=kind, address=0x20000000, size=4))
+                result = self.s.control(m.BreakpointAdd(session_id='s', action='breakpoint_set', kind=kind, address=0x20000000, size=4))
                 self.p.watchpoint_set.assert_called_with(0x20000000, data_mask=0xffffffff, access_size=32, read=rd, write=wr)
-                self.s.breakpoint(m.BreakpointRemove(session_id='s', action='remove', breakpoint_id=result['breakpoint_id']))
+                self.s.control(m.BreakpointRemove(session_id='s', action='breakpoint_remove', breakpoint_id=result['breakpoint_id']))
                 self.p.watchpoint_clear.assert_called_with(8)
         self.p.breakpoint_clear.assert_not_called()
 
     def test_watchpoint_unknown_variable_mismatch_and_alignment(self):
         self.s.symbols = Mock()
         with self.assertRaisesRegex(Exception, 'verify_image'):
-            self.s.breakpoint(m.BreakpointAdd(session_id='s', action='set', kind='write', variable='counter'))
+            self.s.control(m.BreakpointAdd(session_id='s', action='breakpoint_set', kind='write', variable='counter'))
         with self.assertRaises(Exception):
-            self.s.breakpoint(m.BreakpointAdd(session_id='s', action='set', kind='write', address=0x20000001, size=4))
+            self.s.control(m.BreakpointAdd(session_id='s', action='breakpoint_set', kind='write', address=0x20000001, size=4))
         self.p.watchpoint_set.assert_not_called()
 
     def test_variable_watchpoint_resolves_bounded_type(self):
         self.s.symbols = Mock()
         self.s.symbols.variable.return_value = dict(address=0x20000000, size=4, type=dict(kind='float', size=4))
         self.s.image_match = dict(status='matched')
-        result = self.s.breakpoint(m.BreakpointAdd(session_id='s', action='set', kind='write', variable='motor.iq'))
+        result = self.s.control(m.BreakpointAdd(session_id='s', action='breakpoint_set', kind='write', variable='motor.iq'))
         self.assertEqual(result['size'], 4)
         self.assertEqual(result['address'], 0x20000000)
 
@@ -170,7 +170,7 @@ class DebugExtensionTests(unittest.TestCase):
                    dict(kind='write', symbol='main'), dict(address=1, symbol='main'), dict(kind='write', address=4, size=8)]
         for params in invalid:
             with self.subTest(params=params), self.assertRaises(ValidationError):
-                m.BreakpointAdd(session_id='s', action='set', **params)
+                m.BreakpointAdd(session_id='s', action='breakpoint_set', **params)
         with self.assertRaises(ValidationError):
             m.InspectFault(session_id='s', action='fault', frame_address=0x20000000)
         with self.assertRaises(ValidationError):
