@@ -1,4 +1,4 @@
-# J-Link MCP 0.6.1
+# J-Link MCP 0.6.2
 
 面向嵌入式调试任务的 MCP 服务。对外提供 **8 个工具**：读取与采集统一到 read，执行控制与断点统一到 control。J-Link DLL、ELF 符号解析和 SVD 是内部实现。0.6 调整了工具名与读取请求，升级后需重载 MCP 客户端；迁移见 [迁移说明](docs/MIGRATION.md)。
 
@@ -27,7 +27,7 @@ SDK 固定兼容范围 `mcp>=1.26.0,<2`；MCP 2.x 更改了 FastMCP API。ELF �
 | discover | 枚举探针、可用 SVD、能力边界，不连接目标 |
 | session | open / status / close |
 | read | read / snapshot / diff / sample；支持 memory / register / peripheral / symbol / variable |
-| write | 单次 memory / register / peripheral 写入，可显式校验 |
+| write | 单次 memory / register / peripheral / variable 写入，可显式校验 |
 | control | halt / resume / reset / step / wait / run_until / breakpoint_set / breakpoint_remove / breakpoint_list |
 | inspect | symbol / variable / preflight / svd / context / fault |
 | firmware | verify_image / program / verify / backup / erase_pages / erase_chip |
@@ -107,9 +107,23 @@ read 负责观测和记录，control 负责执行状态与断点生命周期；w
 
 分别发给 `inspect`、`read`。`inspect variable` 只解析地址和类型；`read variable` 默认要求本会话已有 matched 证据。显式 `require_match=false` 可进行不匹配调查，结果仍标记实际 elf_match，不能据此确认变量语义。所有类型读取必须落在配置的 RAM/Flash 内；配置不是通用写入访问控制表。
 
-支持具有固定地址的全局变量、嵌套结构体、连续定长数组、整数、浮点、布尔和枚举。`global.member[index]` 是唯一选择语法；指针只显示地址，不解引用。拒绝局部变量、动态位置、函数调用、位域、联合体、动态/跨步数组等未支持类型。单对象最大 64KB，数组最多 4096 元素，类型深度最多 16，解码值树最多 8192 节点。返回值同时保留原始字节；NaN/Infinity 用字符串表达，保持合法 JSON。
+支持具有固定地址的全局变量、嵌套结构体、具名 union 成员、连续定长数组、整数、浮点、布尔和枚举。`global.member[index]` 是唯一选择语法；指针只显示地址，不解引用。读取整个 union 时返回 `{"data_hex":"...","active_member":null}` 和成员名称列表；选择 `packet.payload.u32`、`packet.payload.bytes[3]` 等明确路径后才按选定成员解析，不推断哪个分支有效。拒绝局部变量、动态位置、函数调用、位域、匿名成员自动展开、动态/跨步数组等未支持类型。单对象最大 64KB，数组最多 4096 元素，类型深度最多 16，解码值树最多 8192 节点。返回值同时保留原始字节；NaN/Infinity 用字符串表达，保持合法 JSON。
 
 read 的 snapshot/sample 直接复用 variable。运行中的多变量或结构体读取不保证一致时刻。显式写入、复位、Flash 修改尝试和连接失效会清除映像匹配证据；外部工具或目标自行改写 Flash 无法自动检测，必要时重新 verify_image。
+
+## 类型化变量写入（0.6.2）
+
+现有 `write` 新增 `kind="variable"`，复用同一套 DWARF 路径、类型和对象边界检查。以下名称仅为示例，必须替换成当前 ELF 中存在的变量。
+
+```json
+{"request":{"session_id":"返回的ID","item":{"kind":"variable","name":"packet.payload.u32","value":305419896},"consistency":"halted","verify":true}}
+```
+
+先在加载当前 ELF 和项目配置的会话中执行 `firmware verify_image`，确认 matched，并显式 `control halt`。类型化写入必须满足 `consistency="halted"`、CPU 已暂停和目标完整位于配置 RAM 内；不能设置 `require_match=false` 绕过匹配。拒绝 const 对象、const 父对象的成员和 atomic 对象。Flash 使用 `firmware`。
+
+支持整数、有限浮点、布尔、枚举、指针地址值及一维定长标量数组。枚举可传精确名称或范围内整数；布尔只接受 true/false，数组必须提供完整长度。整数溢出、非有限浮点和类型不符均在写入前拒绝。只能写选定标量或数组，不整块覆盖结构体/union，不填充 padding，也不解引用指针。`packet.payload.bytes` 可传完整字节数组，写一个元素则使用 `packet.payload.bytes[3]`。
+
+请求只提交所选范围一次，`verify=true` 按原范围读回，返回地址、类型、ELF SHA256、编码字节和提交值；校验不符或完成未知时不自动重试。提交写入会清除映像匹配证据，下一次默认类型读取或类型写入前需重新 `firmware verify_image`。CPU 暂停不保证 DMA 静止；本接口不提供原子多变量事务。升级后需重载 MCP 服务并刷新工具 schema，对外仍为 8 个工具。
 
 ## 等待、现场定位和数据观察点（0.5）
 

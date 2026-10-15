@@ -15,7 +15,7 @@ from jlink_mcp.service import DebugService
 from jlink_mcp.symbols import SymbolFile
 
 
-def dwarf_elf():
+def dwarf_elf(unions=False):
     # DWARF v4, direct strings, ref4, constant member offsets, exprloc globals.
     abbrev = bytes([
         1, 0x11, 1, 0, 0,
@@ -26,6 +26,14 @@ def dwarf_elf():
         6, 0x21, 0, 0x2f, 0x0b, 0, 0,
         7, 0x34, 0, 3, 8, 0x49, 0x13, 2, 0x18, 0, 0,
         8, 0x0f, 0, 0x0b, 0x0b, 0, 0, 0])
+    if unions:
+        abbrev = abbrev[:-1] + bytes([
+            9, 0x17, 1, 3, 8, 0x0b, 0x0b, 0, 0,
+            10, 0x0d, 0, 3, 8, 0x49, 0x13, 0, 0,
+            11, 0x26, 0, 0x49, 0x13, 0, 0,
+            12, 0x04, 1, 3, 8, 0x0b, 0x0b, 0x49, 0x13, 0, 0,
+            13, 0x28, 0, 3, 8, 0x1c, 0x0d, 0, 0,
+            14, 0x47, 0, 0x49, 0x13, 0, 0, 0])
     body = bytearray(b'\x01')
     def add(data):
         offset = len(body) + 11
@@ -39,7 +47,35 @@ def dwarf_elf():
     for name, typ, off in [('value', flt, 0), ('items', array, 4), ('ptr', pointer, 20)]:
         add(b'\x04' + name.encode() + b'\0' + struct.pack('<I', typ) + bytes([off]))
     add(b'\0')
-    for name, typ, address in [('state', obj, 0x20000000), ('counter', u32, 0x20000018)]:
+    globals_ = [('state', obj, 0x20000000), ('counter', u32, 0x20000018)]
+    if unions:
+        i32 = add(b'\x02int32_t\0\x04\x05')
+        u8 = add(b'\x02uint8_t\0\x01\x08')
+        boolean = add(b'\x02bool\0\x01\x02')
+        const_u8 = add(b'\x0b' + struct.pack('<I', u8))
+        const_array = add(b'\x05' + struct.pack('<I', const_u8) + b'\x06\x03\0')
+        byte_array = add(b'\x05' + struct.pack('<I', u8) + b'\x06\x0f\0')
+        pair = add(b'\x03Pair\0\x08')
+        for name, typ, off in [('a', i32, 0), ('b', flt, 4)]:
+            add(b'\x04' + name.encode() + b'\0' + struct.pack('<I', typ) + bytes([off]))
+        add(b'\0')
+        enum = add(b'\x0cMode\0\x04' + struct.pack('<I', i32))
+        add(b'\x0dOFF\0\0\x0dON\0\x01\x0dBAD\0\x7f\0')
+        union = add(b'\x09Payload\0\x10')
+        for name, typ in [('u32', u32), ('bytes', byte_array), ('pair', pair), ('flag', boolean), ('mode', enum)]:
+            add(b'\x0a' + name.encode() + b'\0' + struct.pack('<I', typ))
+        add(b'\x04real\0' + struct.pack('<I', flt) + b'\0\0')
+        packet = add(b'\x03Packet\0\x18')
+        for name, typ, off in [('tag', u32, 0), ('payload', union, 4), ('trailer', u32, 20)]:
+            add(b'\x04' + name.encode() + b'\0' + struct.pack('<I', typ) + bytes([off]))
+        add(b'\0')
+        union_array = add(b'\x05' + struct.pack('<I', union) + b'\x06\x01\0')
+        const_packet = add(b'\x0b' + struct.pack('<I', packet))
+        atomic_u32 = add(b'\x0e' + struct.pack('<I', u32))
+        globals_ += [('packet', packet, 0x20000040), ('payloads', union_array, 0x20000080),
+                     ('readonly_packet', const_packet, 0x200000c0), ('readonly_bytes', const_array, 0x20000100),
+                     ('atomic_counter', atomic_u32, 0x20000120)]
+    for name, typ, address in globals_:
         add(b'\x07' + name.encode() + b'\0' + struct.pack('<I', typ) + b'\x05\x03' + struct.pack('<I', address))
     add(b'\0')
     debug = struct.pack('<IHI B', len(body) + 7, 4, 0, 4) + body

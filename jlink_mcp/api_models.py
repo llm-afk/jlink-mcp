@@ -73,7 +73,7 @@ class SymbolItem(Request):
 
 class VariableItem(Request):
     kind: Literal["variable"]
-    name: Name = Field(description="Static DWARF global.member[index]; no calls or pointer dereference")
+    name: Name = Field(description="Static DWARF global.member[index], including named union members; no calls or pointer dereference")
     require_match: bool = Field(default=True, description="Require matched ELF read-only image evidence in this session")
 
 
@@ -106,7 +106,17 @@ class PeripheralWrite(Request):
     value: Address
 
 
-WriteItem = Annotated[Union[MemoryWrite, RegisterWrite, PeripheralWrite], Field(discriminator="kind")]
+ScalarValue = Union[bool, int, float, Annotated[str, Field(min_length=1, max_length=256)]]
+
+
+class VariableWrite(Request):
+    kind: Literal["variable"]
+    name: Name = Field(description="Explicit static global/member/index, including named union members; matched ELF and halted RAM required")
+    value: Union[ScalarValue, Annotated[list[ScalarValue], Field(min_length=1, max_length=4096)]] = Field(
+        description="Scalar or exact-length 1D scalar array; enum accepts an exact name or integer; no struct/union objects")
+
+
+WriteItem = Annotated[Union[MemoryWrite, RegisterWrite, PeripheralWrite, VariableWrite], Field(discriminator="kind")]
 
 
 class WriteRequest(Bound):

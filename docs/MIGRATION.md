@@ -1,5 +1,17 @@
 # 迁移到精简接口
 
+## 0.6.1 → 0.6.2：具名 union 与类型化写入
+
+仍为 8 个工具，已有请求兼容。`inspect variable`、`read variable` 和变量观察点支持 `packet.payload.u32` 等具名 union 路径及成员数组索引。读取整个 union 返回原始 `data_hex`、`active_member=null` 和成员名称列表，不把所有分支同时解释为有效值。匿名成员自动展开和位域仍不支持。
+
+`write` 的 item 新增 `kind="variable"`，参数为 name 和 value；外层仍为 session_id、consistency、verify。支持标量及完整的一维定长标量数组，枚举接受精确名称或整数。类型化写入要求项目 RAM、matched ELF、CPU 已暂停且 consistency=halted，无匹配绕过选项，拒绝 const/atomic 及整个结构体/union 写入。只提交选定范围，不修改 union 尾部或结构体 padding。
+
+```json
+{"request":{"session_id":"当前ID","item":{"kind":"variable","name":"packet.payload.u32","value":123},"verify":true}}
+```
+
+沿用写入清除映像匹配证据的约定：提交后须重新执行 firmware verify_image，才能继续默认类型读取或类型写入。verify=true 是所写字节的读回，不替代映像校验，也不证明 union 的业务标签已同步。未知完成和校验失败均不自动重试。升级后重载服务并刷新 tools/list；不增加独立 VariableWrite 工具。
+
 ## 0.6.0 → 0.6.1：性能与速率
 
 仍为 8 个工具，既有 action/kind、会话和匹配约定保持。session open 和项目配置新增可选 `speed_khz`，auto 或 5–50000 的整数 kHz；不配置时保持 auto。c1_driver 示例声明实板验证通过的 10000 kHz（10 MHz），20 MHz 连接及读取失败后经工程用户同意采用此速率。

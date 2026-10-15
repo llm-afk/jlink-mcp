@@ -51,8 +51,9 @@ async def read(request: ReadRequest) -> dict:
 
     action selects read/snapshot/diff/sample. Each batch is <=64KB, sequential,
     never atomic. live never halts; CPU registers require explicit halt + halted.
-    Variables support global.member[index], profiled bounds and matched image
-    by default; require_match=false marks uncertain interpretation.
+    Variables support global.member[index], including named union members,
+    profiled bounds and matched image by default. Whole unions return opaque
+    bytes; require_match=false marks uncertain interpretation.
     At most 16 snapshots; expire on reset/Flash/reconnect or eviction. Sampling writes an
     exclusive JSONL file: <=128 samples, 1MiB raw payload, 10s requested window.
     """
@@ -61,10 +62,13 @@ async def read(request: ReadRequest) -> dict:
 
 @mcp.tool()
 async def write(request: WriteRequest) -> dict:
-    """Write one memory span or register, with optional explicit readback.
+    """Write memory, a register/peripheral, or a typed ELF variable with readback.
 
     Never auto-halts or retries. Verification can trigger peripheral read side
-    effects. For firmware use firmware, not raw memory writes.
+    effects. Typed writes require halted consistency, matched image and profiled
+    RAM; select a scalar or fixed 1D scalar array, including named union members.
+    const/atomic and aggregate writes are rejected. Submitted writes invalidate
+    image matching; reverify before further typed access. Use firmware for Flash.
     """
     return await call("write", request)
 
@@ -88,7 +92,9 @@ async def control(request: ControlRequest) -> dict:
 async def inspect(request: InspectRequest) -> dict:
     """Inspect symbols/types/SVD/preflight, halted context or Cortex-M fault evidence.
 
-    context maps PC/LR to ELF source ranges and disassembles bounded target bytes.
+    variable resolves explicit global/member/index paths, including named union
+    members, without reading the target. context maps PC/LR to ELF source ranges
+    and disassembles bounded target bytes.
     fault recovers a bounded exception frame at handler entry or caller-supplied
     frame_address+exc_return, with profile RAM bounds. No guessed call stack.
     """

@@ -52,12 +52,14 @@ def constant(die, name, default=None):
     return value.value
 
 
-def underlying(die):
+def underlying(die, write_restrictions=None):
     visited = set()
     while die.tag in ("DW_TAG_typedef", "DW_TAG_const_type", "DW_TAG_volatile_type", "DW_TAG_restrict_type", "DW_TAG_atomic_type"):
         if die.offset in visited or len(visited) >= 32:
             raise ValueError("Cyclic or excessively nested type")
         visited.add(die.offset)
+        if write_restrictions is not None and die.tag in ("DW_TAG_const_type", "DW_TAG_atomic_type"):
+            write_restrictions.add("const" if die.tag == "DW_TAG_const_type" else "atomic")
         die = die.get_DIE_from_attribute("DW_AT_type")
     return die
 
@@ -101,11 +103,13 @@ def array_shape(die):
     return counts
 
 
-def member_offset(member):
+def member_offset(member, union=False):
     if "DW_AT_bit_size" in member.attributes or "DW_AT_data_bit_offset" in member.attributes:
         raise ValueError("Bitfields are not supported")
     value = member.attributes.get("DW_AT_data_member_location")
     if value is None:
+        if union:
+            return 0
         raise ValueError("Member has no fixed offset")
     if describe_form_class(value.form) == "constant":
         offset = value.value
@@ -116,6 +120,8 @@ def member_offset(member):
         offset = operations[0].args[0]
     if not 0 <= offset <= 65536:
         raise ValueError("Invalid member offset")
+    if union and offset != 0:
+        raise ValueError("Union member must start at offset zero")
     return offset
 
 
@@ -158,6 +164,22 @@ def describe(die, depth=0, budget=None):
             if offset + child_type["size"] > result["size"]:
                 raise ValueError("Member lies outside its structure")
             result["fields"].append({"name": name, "offset": offset, "type": child_type})
+    elif die.tag == "DW_TAG_union_type":
+        # Describe choices without interpreting every overlapping view as active.
+        members = []
+        for child in die.iter_children():
+            if child.tag != "DW_TAG_member":
+                continue
+            budget[0] -= 1
+            if budget[0] < 0:
+                raise ValueError("Type is too complex")
+            name = name_of(child)
+            if not name or name in members:
+                raise ValueError("Anonymous or duplicate union members are unsupported")
+            members.append(name)
+        if not members:
+            raise ValueError("Union has no named members")
+        result.update(kind="union", members=members)
     elif die.tag == "DW_TAG_array_type":
         result.update(kind="array", shape=array_shape(die),
                       element=describe(die.get_DIE_from_attribute("DW_AT_type"), depth + 1, budget))
@@ -174,6 +196,8 @@ def decode(schema, data, budget=None):
     if budget[0] < 0 or len(data) != schema["size"]:
         raise ValueError("Decoded value exceeds limits or byte length is incorrect")
     kind = schema["kind"]
+    if kind == "union":
+        return {"data_hex": data.hex(), "active_member": None}
     if kind == "struct":
         return {f["name"]: decode(f["type"], data[f["offset"]:f["offset"] + f["type"]["size"]], budget)
                 for f in schema["fields"]}
@@ -194,6 +218,49 @@ def decode(schema, data, budget=None):
     if kind in ("pointer", "address"):
         return {"address": value, "hex": f"0x{value:08x}", "dereferenced": False}
     return bool(value) if kind == "bool" else value
+
+
+def encode(schema, value):
+    """Encode one scalar or fixed 1D scalar array; never fill aggregate padding."""
+    kind, size = schema["kind"], schema["size"]
+    if not isinstance(size, int) or not 0 < size <= 65536:
+        raise ValueError("Invalid typed write size")
+    if kind == "array":
+        shape = schema["shape"]
+        element = schema["element"]
+        if len(shape) != 1 or not 0 < shape[0] <= 4096 or element["kind"] in ("array", "struct", "union"):
+            raise ValueError("Write an explicit member/index or a 1D scalar array")
+        if type(value) is not list or len(value) != shape[0] or size != shape[0] * element["size"]:
+            raise ValueError("Array value must match the exact fixed length")
+        return b''.join(encode(element, item) for item in value)
+    if kind in ("struct", "union"):
+        raise ValueError("Select an explicit scalar member or 1D scalar array for typed writes")
+    if size not in (1, 2, 4, 8):
+        raise ValueError("Unsupported scalar width")
+    if kind == "bool":
+        if type(value) is not bool:
+            raise ValueError("Boolean variable requires true or false")
+        return int(value).to_bytes(size, 'little')
+    if kind == "float":
+        if size not in (4, 8) or type(value) not in (int, float):
+            raise ValueError("Float variable requires a finite number")
+        try:
+            if not math.isfinite(value):
+                raise ValueError("Float variable requires a finite number")
+            return struct.pack('<f' if size == 4 else '<d', value)
+        except (OverflowError, struct.error) as exc:
+            raise ValueError("Float value is outside the target type range") from exc
+    if kind == "enum" and type(value) is str:
+        if value not in schema["values"]:
+            raise ValueError("Unknown enum name")
+        value = schema["values"][value]
+    if kind not in ("signed", "unsigned", "enum", "pointer", "address") or type(value) is not int:
+        raise ValueError("Integer/address requires an integer; enum also accepts an exact name")
+    signed = kind == "signed" or (kind == "enum" and schema["signed"])
+    try:
+        return value.to_bytes(size, 'little', signed=signed)
+    except OverflowError as exc:
+        raise ValueError("Integer value is outside the target type range") from exc
 
 
 class DwarfVariables:
@@ -246,19 +313,20 @@ class DwarfVariables:
         if owner is None:
             raise ValueError("Variable has no complete DWARF type")
         die = owner.get_DIE_from_attribute("DW_AT_type")
+        restrictions = set()
         base, total = address, byte_size(die)
         tokens = re.findall(r"\.([A-Za-z_][A-Za-z_0-9]*)|\[([0-9]+)\]", expression[len(root):])
         position = 0
         while position < len(tokens):
             member, index = tokens[position]
-            die = underlying(die)
+            die = underlying(die, restrictions)
             if member:
-                if die.tag != "DW_TAG_structure_type":
-                    raise ValueError("Member access requires a structure")
+                if die.tag not in ("DW_TAG_structure_type", "DW_TAG_union_type"):
+                    raise ValueError("Member access requires a structure or union")
                 members = [c for c in die.iter_children() if c.tag == "DW_TAG_member" and name_of(c) == member]
                 if len(members) != 1:
                     raise ValueError(f"Unknown or ambiguous member {member}")
-                offset = member_offset(members[0])
+                offset = member_offset(members[0], union=die.tag == "DW_TAG_union_type")
                 child = members[0].get_DIE_from_attribute("DW_AT_type")
                 if offset + byte_size(child) > byte_size(die):
                     raise ValueError("Member exceeds structure bounds")
@@ -279,10 +347,17 @@ class DwarfVariables:
                     address += index * math.prod(shape[axis + 1:]) * byte_size(element)
                     position += 1
                 die = element
+        die = underlying(die, restrictions)
+        element = die
+        for _ in range(16):
+            if element.tag != "DW_TAG_array_type":
+                break
+            element = underlying(element.get_DIE_from_attribute("DW_AT_type"), restrictions)
         schema = describe(die)
         if address < base or address + schema["size"] > base + total:
             raise ValueError("Selected variable lies outside its global object")
-        result = {"expression": expression, "address": address, "size": schema["size"], "type": schema}
+        result = {"expression": expression, "address": address, "size": schema["size"], "type": schema,
+                  "write_restrictions": sorted(restrictions)}
         if len(self._resolved) >= 256:
             self._resolved.popitem(last=False)
         self._resolved[key] = result

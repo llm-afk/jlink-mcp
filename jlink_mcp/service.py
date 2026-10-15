@@ -21,7 +21,7 @@ from .profiles import load_profile
 from .image_match import compare_image
 from .source_context import disassemble
 from .fault_context import recover_frame, decode_fault_flags
-from .dwarf_variables import decode
+from .dwarf_variables import decode, encode
 from .svd_manager import svd_manager
 from .target_access import read_bytes, write_bytes, validate_span, register_name, aligned_width
 from .tools import connection, debug, flash, rtt, svd
@@ -128,7 +128,9 @@ class DebugService:
 
     def capabilities(self):
         return {"backend": "jlink-dll", "read_kinds": ["memory", "register", "peripheral", "symbol", "variable"],
+                "write_kinds": ["memory", "register", "peripheral", "variable"],
                 "elf": "32-bit little-endian ET_EXEC; static DWARF globals/members/fixed arrays",
+                "typed_write": "halted, matched ELF, profiled RAM; scalar or fixed 1D scalar array; named union paths",
                 "execution_debug": self.target is not None and self.target["architecture"] == "cortex-m",
                 "read_actions": ["read", "snapshot", "diff", "sample"], "channel": "RTT",
                 "control": ["halt", "resume", "reset", "step", "wait", "run_until",
@@ -251,14 +253,7 @@ class DebugService:
                 raise ServiceError("UNSUPPORTED_SYMBOL", "Reading requires a sized object symbol <=64KB")
             address, size, width = symbol["address"], symbol["size"], 8
         elif item.kind == "variable":
-            if self.profile is None:
-                raise ServiceError("PROFILE_REQUIRED", "Typed reads require profiled RAM/Flash regions")
-            if item.require_match and self.image_match["status"] != "matched":
-                raise ServiceError("IMAGE_NOT_MATCHED", "Run firmware verify_image first, or explicitly set require_match=false")
-            info = self._variable(item.name)
-            if not any(r.address <= info["address"] and info["address"] + info["size"] <= r.address + r.size
-                       for r in self.profile.regions):
-                raise ServiceError("OUTSIDE_PROFILE", "Variable lies outside configured RAM/Flash")
+            info = self._typed_variable(item.name, item.require_match)
             return {"kind": "variable", "address": info["address"], "bytes": info["size"],
                     "width": aligned_width(info["address"], info["size"]), "type": info["type"]}
         else:
@@ -270,6 +265,17 @@ class DebugService:
             size, width = info.size // 8, info.size
         validate_span(address, size, width)
         return {"kind": item.kind, "address": address, "bytes": size, "width": width}
+
+    def _typed_variable(self, name, require_match=True):
+        if self.profile is None:
+            raise ServiceError("PROFILE_REQUIRED", "Typed access requires profiled RAM/Flash regions")
+        if require_match and self.image_match["status"] != "matched":
+            raise ServiceError("IMAGE_NOT_MATCHED", "Run firmware verify_image before typed access")
+        info = self._variable(name)
+        if not any(r.address <= info["address"] and info["address"] + info["size"] <= r.address + r.size
+                   for r in self.profile.regions):
+            raise ServiceError("OUTSIDE_PROFILE", "Variable lies outside configured RAM/Flash")
+        return info
 
     def _read_one(self, item, plan):
         if item.kind == "register":
@@ -327,8 +333,22 @@ class DebugService:
                 else "sequential live reads; not a simultaneous snapshot"}
 
     def write(self, request):
-        self.image_match = {"status": "unknown", "reason": "write requested; reverify before trusting symbol interpretation"}
         item = request.item
+        variable = None
+        if item.kind == "variable":
+            if request.consistency != "halted":
+                raise ServiceError("REQUIRES_HALT", "Typed writes require explicitly halted consistency")
+            self._halted()
+            variable = self._typed_variable(item.name)
+            if variable.get("write_restrictions"):
+                raise ServiceError("READ_ONLY", "Typed writes reject const and atomic objects")
+            address = variable["address"]
+            if not any(r.kind == "ram" and r.address <= address and address + variable["size"] <= r.address + r.size
+                       for r in self.profile.regions):
+                raise ServiceError("RAM_REQUIRED", "Use firmware for Flash; typed writes require profiled RAM")
+            data = encode(variable["type"], item.value)
+            width = aligned_width(address, len(data))
+        self.image_match = {"status": "unknown", "reason": "write requested; reverify before trusting symbol interpretation"}
         if request.consistency == "halted" or item.kind == "register":
             self._halted()
         if item.kind == "register":
@@ -342,7 +362,7 @@ class DebugService:
             if item.kind == "memory":
                 data = bytes.fromhex(item.data_hex)
                 address, width = item.address, item.width
-            else:
+            elif item.kind == "peripheral":
                 address, info, _, _ = self._peripheral(item.name)
                 if info.access == "read-only":
                     raise ServiceError("READ_ONLY", "Cannot write a read-only SVD register")
@@ -354,9 +374,13 @@ class DebugService:
             observed = read_bytes(self.probe, address, len(data), width).hex() if request.verify else None
             matched = observed == data.hex() if request.verify else None
         stable = request.consistency != "halted" or self._state() == "halted"
-        return {"success": matched is not False and stable, "submitted": True,
-                "verification": "matched" if matched else "mismatch" if matched is False else "not_requested",
-                "observed": observed, "state_preserved": stable}
+        result = {"success": matched is not False and stable, "submitted": True,
+                  "verification": "matched" if matched else "mismatch" if matched is False else "not_requested",
+                  "observed": observed, "state_preserved": stable}
+        if variable is not None:
+            result.update(variable={**variable, "elf_sha256": self.symbols.sha256},
+                          data_hex=data.hex(), value=decode(variable["type"], data))
+        return result
 
     def _cortex_m(self):
         if self.target["architecture"] != "cortex-m":

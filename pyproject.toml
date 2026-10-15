@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jlink-mcp"
-version = "0.6.1"
+version = "0.6.2"
 description = "面向嵌入式调试的精简 J-Link MCP 服务"
 readme = "README.md"
 requires-python = ">=3.10"
