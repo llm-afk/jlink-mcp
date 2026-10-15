@@ -25,6 +25,24 @@ def name_of(die):
     return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
 
 
+def attribute_owner(die, name):
+    """Find a variable attribute without moving CU-relative references."""
+    visited = set()
+    while die is not None:
+        key = (id(die.dwarfinfo), die.offset)
+        if key in visited or len(visited) >= 32:
+            raise ValueError("Cyclic or excessively nested variable inheritance")
+        visited.add(key)
+        if name in die.attributes:
+            return die
+        links = [key for key in ("DW_AT_abstract_origin", "DW_AT_specification")
+                 if key in die.attributes]
+        if len(links) > 1:
+            raise ValueError("Ambiguous variable inheritance")
+        die = die.get_DIE_from_attribute(links[0]) if links else None
+    return None
+
+
 def constant(die, name, default=None):
     value = die.attributes.get(name)
     if value is None:
@@ -199,8 +217,17 @@ class DwarfVariables:
                 except Exception:
                     # An unsupported vendor/TLS location must not hide other globals.
                     continue
-                if len(operations) == 1 and operations[0].op_name == "DW_OP_addr" and name_of(die):
-                    self.variables.setdefault(name_of(die), []).append((operations[0].args[0], die))
+                if len(operations) != 1 or operations[0].op_name != "DW_OP_addr":
+                    continue
+                address = operations[0].args[0]
+                try:
+                    owner = attribute_owner(die, "DW_AT_name")
+                except Exception:
+                    # Malformed inheritance must not hide unrelated globals.
+                    continue
+                name = name_of(owner) if owner is not None else ""
+                if name:
+                    self.variables.setdefault(name, []).append((address, die))
 
     def resolve(self, expression):
         if not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*(?:\.[A-Za-z_][A-Za-z_0-9]*|\[[0-9]+\])*", expression):
@@ -215,7 +242,10 @@ class DwarfVariables:
         if key in self._resolved:
             self._resolved.move_to_end(key)
             return deepcopy(self._resolved[key])
-        die = variable.get_DIE_from_attribute("DW_AT_type")
+        owner = attribute_owner(variable, "DW_AT_type")
+        if owner is None:
+            raise ValueError("Variable has no complete DWARF type")
+        die = owner.get_DIE_from_attribute("DW_AT_type")
         base, total = address, byte_size(die)
         tokens = re.findall(r"\.([A-Za-z_][A-Za-z_0-9]*)|\[([0-9]+)\]", expression[len(root):])
         position = 0
