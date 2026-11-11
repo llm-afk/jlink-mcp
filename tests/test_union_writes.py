@@ -55,6 +55,16 @@ class UnionWriteTests(unittest.TestCase):
         return self.service.invoke('write', m.WriteRequest(session_id='test',
             item=dict(kind='variable', name=name, value=value), **options))
 
+    def match_image(self):
+        def target_read(address, count, nbits=8):
+            if address == 0x08000000 and count == 1 and nbits == 32:
+                return [int.from_bytes(b'CODE', 'little')]
+            return self.read_memory(address, count, nbits)
+        self.probe.memory_read.side_effect = target_read
+        matched = self.service.invoke('firmware', m.FirmwareVerifyImage(action='verify_image', session_id='test'))
+        self.assertEqual(matched['status'], 'matched')
+        return self.service.image_match
+
     def test_named_union_paths_offsets_and_array_index(self):
         for name, address, size in [('packet.payload.u32', 0x20000044, 4),
                                      ('packet.payload.real', 0x20000044, 4),
@@ -133,6 +143,7 @@ class UnionWriteTests(unittest.TestCase):
         self.assertEqual(result['items'][0]['data']['value'], 1.25)
 
     def test_scalar_write_preserves_union_tail_and_neighbors(self):
+        proof = self.match_image()
         original = self.ram[:]
         result = self.write('packet.payload.u32', 0x12345678, verify=True)
         self.assertTrue(result['success'], result)
@@ -142,7 +153,41 @@ class UnionWriteTests(unittest.TestCase):
         expected[0x44:0x48] = b'\x78\x56\x34\x12'
         self.assertEqual(self.ram, expected)
         self.probe.memory_write.assert_called_once_with(0x20000044, [0x12345678], nbits=32)
+        self.assertEqual(result['elf_match_after'], 'matched')
+        self.assertIs(self.service.image_match, proof)
+        self.assertTrue(self.write('packet.payload.flag', True, verify=True)['success'])
+        self.assertIs(self.service.image_match, proof)
+
+    def test_unverified_typed_write_expires_flash_evidence(self):
+        self.match_image()
+        result = self.write('packet.payload.u32', 7)
+        self.assertEqual(result['elf_match_after'], 'unknown')
+        blocked = self.write('packet.payload.u32', 8)
+        self.assertFalse(blocked['submitted'])
+        self.assertEqual(blocked['error']['code'], 'IMAGE_NOT_MATCHED')
+        self.probe.memory_write.assert_called_once()
+
+    def test_preflight_rejection_preserves_evidence_and_never_submits(self):
+        proof = self.match_image()
+        for name, value in [('readonly_packet.payload.u32', 1), ('packet.payload.u32', -1)]:
+            result = self.write(name, value, verify=True)
+            self.assertEqual(result['completion'], 'not_submitted')
+            self.assertFalse(result['submitted'])
+            self.assertIs(self.service.image_match, proof)
+        self.probe.memory_write.assert_not_called()
+
+    def test_late_speed_change_invalidates_verified_ram_evidence(self):
+        self.match_image()
+        self.service.target['requested_speed_khz'] = self.probe.speed = 10000
+        def change_speed(*args, **kwargs):
+            self.probe.speed = 2000
+            return self.write_memory(*args, **kwargs)
+        self.probe.memory_write.side_effect = change_speed
+        result = self.write('packet.payload.u32', 5, verify=True)
+        self.assertEqual(result['error']['code'], 'SPEED_MISMATCH')
+        self.assertEqual(result['completion'], 'unknown')
         self.assertEqual(self.service.image_match['status'], 'unknown')
+        self.probe.memory_write.assert_called_once()
 
     def test_array_write_encodes_exact_length_without_padding(self):
         result = self.write('packet.payload.bytes', list(range(16)))
@@ -202,11 +247,13 @@ class UnionWriteTests(unittest.TestCase):
         self.probe.memory_write.assert_not_called()
 
     def test_verification_mismatch_does_not_retry(self):
+        self.match_image()
         self.probe.memory_read.side_effect = None
         self.probe.memory_read.return_value = [0]
         result = self.write('packet.payload.u32', 1, verify=True)
         self.assertFalse(result['success'])
         self.assertEqual(result['verification'], 'mismatch')
+        self.assertEqual(result['elf_match_after'], 'unknown')
         self.probe.memory_write.assert_called_once()
 
     def test_write_timeout_is_unknown_and_not_retried(self):

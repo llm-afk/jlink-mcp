@@ -1,5 +1,13 @@
 # 迁移到精简接口
 
+## 0.6.2 → 0.6.3
+
+重载后的 MCP 握手和 `session status.server_version` 均报告项目版本。现有八个工具沿用原名称。给 `read` 的 read/snapshot/sample/diff 传 `compact=true` 可缩小结果，省略时返回完整格式。采样文件首行 `types["0"]` 对应第一个 item 的 DWARF 类型，每个采样点仍保留实际读数、原始字节和错误。
+
+连续调参时使用 `write` 的 `kind="variable", verify=true`。已暂停 CPU、同一配置的 RAM 范围和读回均核对成功后，`elf_match_after="matched"` 表示可直接继续类型访问。该状态引用上次只读 Flash 比对的证据，与刚提交的 RAM 值校验分别记录。未校验写、原始地址/寄存器写、校验差异、状态异常和复位/重连均使旧证据失效。失效会话或写入准备阶段的拒绝报告 `submitted=false, completion="not_submitted"`。提交后的驱动超时仍为 `completion="unknown"`，不会自动重试。
+
+`channel read` 与 `channel write` 的原有文本用法继续可用。二进制读使用 `format="base64"`，二进制写使用 `data_b64`。批量录制使用同一工具的 `capture` 动作，指定 `size`、`timeout_ms` 和新的 `output_path`。以 `complete` 和字节数判断是否收齐。`channel status` 在驱动支持时返回缓冲区和主机溢出计数。
+
 ## 0.6.1 → 0.6.2：具名 union 与类型化写入
 
 仍为 8 个工具，已有请求兼容。`inspect variable`、`read variable` 和变量观察点支持 `packet.payload.u32` 等具名 union 路径及成员数组索引。读取整个 union 返回原始 `data_hex`、`active_member=null` 和成员名称列表，不把所有分支同时解释为有效值。匿名成员自动展开和位域仍不支持。

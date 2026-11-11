@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import api_models as contracts
+from . import __version__, api_models as contracts
 from .gdb_server import gdb_server_manager
 from .jlink_manager import jlink_manager
 from .symbols import SymbolFile
@@ -31,6 +31,10 @@ class ServiceError(Exception):
     def __init__(self, code, message):
         super().__init__(message)
         self.code = code
+
+
+class WriteNotSubmitted(Exception):
+    """The cause occurred before any driver write was submitted."""
 
 
 def utc_now():
@@ -90,7 +94,11 @@ class DebugService:
     def _verify_speed(self):
         requested = (self.target or {}).get("requested_speed_khz")
         if self.probe is not None and isinstance(requested, int):
-            actual = self.probe.speed
+            try:
+                actual = self.probe.speed
+            except Exception:
+                self._invalidate()
+                raise
             self.target["speed_khz"] = actual
             if actual != requested:
                 self._invalidate()
@@ -116,9 +124,13 @@ class DebugService:
                 if not isinstance(request, contracts.CloseSession):
                     self._verify_speed()
             except Exception as exc:
-                result = error_result(exc)
+                rejected = isinstance(exc, WriteNotSubmitted)
+                result = error_result(exc.__cause__ if rejected else exc)
                 if method in ("write", "control", "firmware"):
-                    result["completion"] = "unknown"
+                    if not authorized or rejected:
+                        result.update(submitted=False, completion="not_submitted")
+                    else:
+                        result["completion"] = "unknown"
                     result["retry_safe"] = False
             result["meta"] = {"session_id": self.session_id, "target": copy.deepcopy(self.target),
                               "generation": self.generation, "timestamp": timestamp,
@@ -146,7 +158,7 @@ class DebugService:
 
     def session(self, request):
         if request.action == "status":
-            return {"success": True, "connection": connection.get_connection_status(),
+            return {"success": True, "server_version": __version__, "connection": connection.get_connection_status(),
                     "elf": self._elf_identity(), "image_match": copy.deepcopy(self.image_match),
                     "profile": {"identity": self.profile_identity, "config": self.profile.model_dump()} if self.profile else None,
                     "capabilities": self.capabilities(), "channel": rtt.rtt_get_status()}
@@ -206,7 +218,7 @@ class DebugService:
         self._invalidate()
         return {"success": True, "session_id": self.session_id, "capabilities": self.capabilities(),
                 "elf": self._elf_identity(), "profile": profile_identity,
-                "connection": connection.get_connection_status()}
+                "connection": actual}
 
     def _elf_identity(self):
         return {**self.symbols.identity(), "target_match": self.image_match["status"]} if self.symbols else None
@@ -269,24 +281,31 @@ class DebugService:
     def _typed_variable(self, name, require_match=True):
         if self.profile is None:
             raise ServiceError("PROFILE_REQUIRED", "Typed access requires profiled RAM/Flash regions")
-        if require_match and self.image_match["status"] != "matched":
-            raise ServiceError("IMAGE_NOT_MATCHED", "Run firmware verify_image before typed access")
+        if require_match:
+            self._require_image_match()
         info = self._variable(name)
-        if not any(r.address <= info["address"] and info["address"] + info["size"] <= r.address + r.size
-                   for r in self.profile.regions):
+        if not self._in_memory(info["address"], info["size"]):
             raise ServiceError("OUTSIDE_PROFILE", "Variable lies outside configured RAM/Flash")
         return info
 
-    def _read_one(self, item, plan):
+    def _require_image_match(self):
+        if self.image_match["status"] != "matched":
+            raise ServiceError("IMAGE_NOT_MATCHED", "Run firmware verify_image before typed access")
+
+    def _read_one(self, item, plan, compact):
         if item.kind == "register":
             self._halted()
             value = self.probe.register_read(plan["name"]) & 0xFFFFFFFF
             self._halted()
             return {"value": value}
+        if item.kind == "variable" and item.require_match:
+            self._require_image_match()
         data = read_bytes(self.probe, plan["address"], plan["bytes"], plan["width"])
         result = {"address": plan["address"], "size": len(data), "data_hex": data.hex()}
         if item.kind == "variable":
-            result.update(value=decode(plan["type"], data), type=plan["type"], elf_match=self.image_match["status"])
+            result.update(value=decode(plan["type"], data), elf_match=self.image_match["status"])
+            if not compact:
+                result["type"] = plan["type"]
         if item.kind == "peripheral":
             _, _, peripheral, register = self._peripheral(item.name)
             result["decoded"] = svd_manager.parse_register_value(
@@ -296,15 +315,16 @@ class DebugService:
     def read(self, request):
         return self._read(request) if request.action == "read" else self._capture(request)
 
-    def _read(self, request):
+    def _read(self, request, plans=None):
         if request.consistency == "halted":
             self._halted()
-        plans = []
-        for item in request.items:
-            try:
-                plans.append(self._plan_read(item))
-            except Exception as exc:
-                plans.append(error_result(exc))
+        if plans is None:
+            plans = []
+            for item in request.items:
+                try:
+                    plans.append(self._plan_read(item))
+                except Exception as exc:
+                    plans.append(error_result(exc))
         if sum(p.get("bytes", 0) for p in plans) > 65536:
             raise ServiceError("LIMIT", "Total batch size must not exceed 64KB")
         results = []
@@ -318,7 +338,7 @@ class DebugService:
                 else:
                     if request.consistency == "halted":
                         self._halted()
-                    entry.update(success=True, data=self._read_one(item, plan))
+                    entry.update(success=True, data=self._read_one(item, plan, request.compact))
             except Exception as exc:
                 entry.update(error_result(exc))
             results.append(entry)
@@ -332,44 +352,54 @@ class DebugService:
                 "observation": "halted CPU; DMA/peripherals may still change" if request.consistency == "halted"
                 else "sequential live reads; not a simultaneous snapshot"}
 
-    def write(self, request):
-        item = request.item
+    def _plan_memory_write(self, item, verify):
         variable = None
         if item.kind == "variable":
-            if request.consistency != "halted":
-                raise ServiceError("REQUIRES_HALT", "Typed writes require explicitly halted consistency")
-            self._halted()
             variable = self._typed_variable(item.name)
             if variable.get("write_restrictions"):
                 raise ServiceError("READ_ONLY", "Typed writes reject const and atomic objects")
             address = variable["address"]
-            if not any(r.kind == "ram" and r.address <= address and address + variable["size"] <= r.address + r.size
-                       for r in self.profile.regions):
+            if not self._in_memory(address, variable["size"], ram_only=True):
                 raise ServiceError("RAM_REQUIRED", "Use firmware for Flash; typed writes require profiled RAM")
             data = encode(variable["type"], item.value)
             width = aligned_width(address, len(data))
-        self.image_match = {"status": "unknown", "reason": "write requested; reverify before trusting symbol interpretation"}
-        if request.consistency == "halted" or item.kind == "register":
-            self._halted()
+        elif item.kind == "memory":
+            data = bytes.fromhex(item.data_hex)
+            address, width = item.address, item.width
+        else:
+            address, info, _, _ = self._peripheral(item.name)
+            if info.access == "read-only":
+                raise ServiceError("READ_ONLY", "Cannot write a read-only SVD register")
+            if verify and info.access == "write-only":
+                raise ServiceError("WRITE_ONLY", "Cannot verify a write-only SVD register")
+            data, width = item.value.to_bytes(info.size // 8, "little"), info.size
+        validate_span(address, len(data), width)
+        return address, data, width, variable
+
+    def write(self, request):
+        item = request.item
+        variable = None
+        try:
+            if item.kind in ("register", "variable") and request.consistency != "halted":
+                raise ServiceError("REQUIRES_HALT", "Register and typed writes require halted consistency")
+            if request.consistency == "halted":
+                self._halted()
+            if item.kind == "register":
+                name = self._register_name(item.name)
+            else:
+                address, data, width, variable = self._plan_memory_write(item, request.verify)
+                if variable is not None:
+                    self._halted()  # DWARF planning can take time. Check again immediately before writing.
+        except Exception as exc:
+            raise WriteNotSubmitted(str(exc)) from exc
+
+        previous_match = self.image_match
+        self.image_match = {"status": "unknown", "reason": "write submitted; reverify before trusting symbol interpretation"}
         if item.kind == "register":
-            if request.consistency != "halted":
-                raise ServiceError("REQUIRES_HALT", "CPU register writes require halted consistency")
-            name = self._register_name(item.name)
             self.probe.register_write(name, item.value)
             observed = self.probe.register_read(name) & 0xFFFFFFFF if request.verify else None
             matched = observed == item.value if request.verify else None
         else:
-            if item.kind == "memory":
-                data = bytes.fromhex(item.data_hex)
-                address, width = item.address, item.width
-            elif item.kind == "peripheral":
-                address, info, _, _ = self._peripheral(item.name)
-                if info.access == "read-only":
-                    raise ServiceError("READ_ONLY", "Cannot write a read-only SVD register")
-                if request.verify and info.access == "write-only":
-                    raise ServiceError("WRITE_ONLY", "Cannot verify a write-only SVD register")
-                data, width = item.value.to_bytes(info.size // 8, "little"), info.size
-            validate_span(address, len(data), width)
             write_bytes(self.probe, address, data, width)
             observed = read_bytes(self.probe, address, len(data), width).hex() if request.verify else None
             matched = observed == data.hex() if request.verify else None
@@ -378,8 +408,15 @@ class DebugService:
                   "verification": "matched" if matched else "mismatch" if matched is False else "not_requested",
                   "observed": observed, "state_preserved": stable}
         if variable is not None:
+            # verify_image covers immutable Flash only. Keep the original proof
+            # and timestamp after a verified write wholly in a distinct profile RAM region.
+            if (matched and stable and previous_match.get("generation") == self.generation
+                    and previous_match.get("elf_sha256") == self.symbols.sha256
+                    and previous_match.get("profile") == self.profile_identity):
+                self.image_match = previous_match
             result.update(variable={**variable, "elf_sha256": self.symbols.sha256},
-                          data_hex=data.hex(), value=decode(variable["type"], data))
+                          data_hex=data.hex(), value=decode(variable["type"], data),
+                          elf_match_after=self.image_match["status"])
         return result
 
     def _cortex_m(self):
@@ -673,9 +710,16 @@ class DebugService:
                     changes.append({"index": index, "status": "unavailable", "before": old, "after": new})
                 elif old["data"] != new["data"]:
                     changes.append({"index": index, "status": "changed", "before": old["data"], "after": new["data"]})
-            return {"success": saved["result"]["success"] and current["success"], "changes": changes,
-                    "snapshot_timestamp": saved["timestamp"], "current": current}
-        reading = contracts.ReadBatch(action="read", session_id=request.session_id, items=request.items, consistency=request.consistency)
+            result = {"success": saved["result"]["success"] and current["success"], "changes": changes,
+                      "snapshot_timestamp": saved["timestamp"]}
+            if request.compact:
+                for change in changes:
+                    change["item"] = saved["result"]["items"][change["index"]]["item"]
+            else:
+                result["current"] = current
+            return result
+        reading = contracts.ReadBatch(action="read", session_id=request.session_id, items=request.items,
+                                      consistency=request.consistency, compact=request.compact)
         if request.action == "snapshot":
             result = self._read(reading)
             key = uuid.uuid4().hex
@@ -685,7 +729,10 @@ class DebugService:
                                    "generation": self.generation, "timestamp": utc_now()}
             return {"success": result["success"], "snapshot_id": key, "result": result}
         plans = [self._plan_read(item) for item in request.items]
-        if sum(p["bytes"] for p in plans) * request.count > 1024 * 1024:
+        batch_bytes = sum(p["bytes"] for p in plans)
+        if batch_bytes > 65536:
+            raise ServiceError("LIMIT", "Total batch size must not exceed 64KB")
+        if batch_bytes * request.count > 1024 * 1024:
             raise ServiceError("LIMIT", "Sample payload must not exceed 1 MiB")
         path = Path(request.output_path or f"captures/{uuid.uuid4().hex}.jsonl").resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -698,10 +745,15 @@ class DebugService:
                     time.sleep(delay)
                 if time.monotonic() - started > 10:
                     break
-                result = self._read(reading)
-                stream.write(json.dumps({"index": index, "timestamp": utc_now(), "session_id": self.session_id,
-                                         "target": self.target, "generation": self.generation,
-                                         "host_elapsed_ms": (time.monotonic() - started) * 1000, "result": result}) + "\n")
+                # The session lock pins the profile and ELF for this sample sequence.
+                # _read still checks halt/match and fetches fresh target bytes each time.
+                result = self._read(reading, plans)
+                record = {"index": index, "timestamp": utc_now(), "session_id": self.session_id,
+                          "target": self.target, "generation": self.generation,
+                          "host_elapsed_ms": (time.monotonic() - started) * 1000, "result": result}
+                if request.compact and index == 0:
+                    record["types"] = {str(i): p["type"] for i, p in enumerate(plans) if "type" in p}
+                stream.write(json.dumps(record, separators=(",", ":")) + "\n")
                 total += 1
                 ok = ok and result["success"]
         return {"success": ok and total == request.count, "sample_count": total,
@@ -770,10 +822,12 @@ class DebugService:
         if request.action == "close":
             return rtt.rtt_stop()
         if request.action == "status":
-            return rtt.rtt_get_status()
+            return rtt.rtt_get_status(include_driver=True)
         if request.action == "read":
-            return rtt.rtt_read(request.buffer_index, request.size, request.timeout_ms)
-        return rtt.rtt_write(request.text, request.buffer_index, request.timeout_ms)
+            return rtt.rtt_read(request.buffer_index, request.size, request.timeout_ms, request.format)
+        if request.action == "capture":
+            return rtt.rtt_capture(request.buffer_index, request.size, request.timeout_ms, request.output_path)
+        return rtt.rtt_write(request.text, request.buffer_index, request.timeout_ms, data_b64=request.data_b64)
 
 
 service = DebugService()

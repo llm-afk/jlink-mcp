@@ -1,7 +1,13 @@
+import base64
+import hashlib
 import io
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
+from pydantic import TypeAdapter, ValidationError
+from jlink_mcp.api_models import ChannelRequest
 from jlink_mcp import target_access, gdb_server
 from jlink_mcp.jlink_manager import jlink_manager
 from jlink_mcp.tools import memory, flash, debug, rtt, svd
@@ -39,6 +45,16 @@ class Contracts(unittest.TestCase):
         self.probe.memory_write.return_value = 4
         self.assertTrue(memory.write_memory(0x20000000, '12 34 56 78', 32)['success'])
         self.probe.memory_write.assert_called_once_with(0x20000000, [0x78563412], nbits=32)
+
+    def test_bulk_write_preserves_unsigned_units_at_every_width(self):
+        raw = b'\x00\x80\xff\xff' * 256
+        self.probe.memory_write.return_value = len(raw)
+        for width in (8, 16, 32):
+            size = width // 8
+            expected = [int.from_bytes(raw[i:i + size], 'little') for i in range(0, len(raw), size)]
+            self.probe.reset_mock()
+            self.assertEqual(target_access.write_bytes(self.probe, 0x20000000, raw, width), len(raw))
+            self.probe.memory_write.assert_called_once_with(0x20000000, expected, nbits=width)
 
     def test_invalid_memory_inputs_never_access_probe(self):
         for address, size, width in [(0, 3, 32), (1, 4, 32), (0xFFFFFFFF, 4, 8), (0, 4, 24)]:
@@ -163,7 +179,9 @@ class Contracts(unittest.TestCase):
     def test_rtt_partial_write_sends_suffix_only(self):
         self.start_rtt()
         self.probe.rtt_write.side_effect = [2, 0, 3]
-        result = rtt.rtt_write('ABCDE')
+        with patch.object(rtt.time, 'sleep') as sleep:
+            result = rtt.rtt_write('ABCDE')
+        sleep.assert_called_once_with(0.001)
         self.assertTrue(result['success'])
         self.assertEqual([c.args[1] for c in self.probe.rtt_write.call_args_list], [b'ABCDE', b'CDE', b'CDE'])
 
@@ -173,6 +191,95 @@ class Contracts(unittest.TestCase):
         result = rtt.rtt_write('ABCDE')
         self.assertFalse(result['success'])
         self.assertEqual(result['bytes_written'], 2)
+
+    def test_rtt_full_buffer_does_not_submit_after_deadline(self):
+        self.start_rtt()
+        self.probe.rtt_write.return_value = 0
+        with patch.object(rtt.time, 'perf_counter', side_effect=[10, 10, 10.020]), patch.object(rtt.time, 'sleep'):
+            result = rtt.rtt_write('P', timeout_ms=10)
+        self.assertFalse(result['success'])
+        self.assertEqual(result['bytes_written'], 0)
+        self.probe.rtt_write.assert_called_once_with(0, b'P')
+
+    def test_binary_read_resets_only_consumed_channel_and_text_omits_hex(self):
+        self.start_rtt(timeout_ms=0)
+        self.probe.rtt_read.side_effect = [b'\xe4', b'\xe4', b'', b'\x00\xff', b'\xb8\xad', b'\xb8\xad']
+        self.assertEqual(rtt.rtt_read(0)['pending_utf8_bytes'], 1)
+        self.assertEqual(rtt.rtt_read(1)['pending_utf8_bytes'], 1)
+        self.assertEqual(rtt.rtt_read(1, data_format='base64')['data_b64'], '')
+        binary = rtt.rtt_read(0, data_format='base64')
+        self.assertEqual(base64.b64decode(binary['data_b64']), b'\x00\xff')
+        self.assertNotIn('data', binary)
+        self.assertEqual(rtt.rtt_read(0)['data'], '\ufffd\ufffd')
+        text = rtt.rtt_read(1, data_format='text')
+        self.assertNotIn('data_hex', text)
+        self.assertEqual(text['data'], '中')
+
+    def test_binary_write_checks_wire_size_encoding_and_payload_choice(self):
+        self.start_rtt()
+        model = TypeAdapter(ChannelRequest)
+        for fields in ({}, {'text': 'abc', 'data_b64': 'AAAA'}):
+            with self.assertRaises(ValidationError):
+                model.validate_python({'action': 'write', 'session_id': 's', **fields})
+        for invalid in ('%%%%', 'abcd====!', base64.b64encode(bytes(65537)).decode()):
+            self.assertFalse(rtt.rtt_write(data_b64=invalid)['success'])
+        self.probe.rtt_write.assert_not_called()
+        self.probe.rtt_write.side_effect = [1, RuntimeError('driver lost')]
+        result = rtt.rtt_write(data_b64='/wA=')
+        self.assertFalse(result['success'])
+        self.assertEqual(result['bytes_written'], 1)
+        self.assertEqual([call.args[1] for call in self.probe.rtt_write.call_args_list], [b'\xff\x00', b'\x00'])
+
+    def test_capture_bounds_file_and_keeps_stream_position(self):
+        self.start_rtt(timeout_ms=0)
+        source = io.BytesIO(bytes(range(256)) * 128)
+        self.probe.rtt_read.side_effect = lambda index, size: source.read(size)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'signal.bin'
+            result = rtt.rtt_capture(0, 17007, 1000, path)
+            self.assertTrue(result['complete'])
+            self.assertEqual(result['bytes_written'], 17007)
+            self.assertFalse(result['timed_out'])
+            self.assertEqual(path.read_bytes(), source.getvalue()[:17007])
+            self.assertEqual(result['sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
+            self.assertFalse(rtt.rtt_capture(0, 42, 1, path)['success'])
+            self.assertEqual(source.tell(), 17007)
+
+    def test_capture_timeout_keeps_partial_file_and_resets_decoder(self):
+        self.start_rtt(timeout_ms=0)
+        self.probe.rtt_read.return_value = b'\xe4'
+        self.assertEqual(rtt.rtt_read()['pending_utf8_bytes'], 1)
+        chunks = [b'Z']
+        self.probe.rtt_read.side_effect = lambda *args: chunks.pop(0) if chunks else b''
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'prefix.bin'
+            result = rtt.rtt_capture(0, 2, 10, path)
+            self.assertTrue(result['timed_out'])
+            self.assertFalse(result['complete'])
+            self.assertEqual(result['bytes_read'], 1)
+            self.assertEqual(path.read_bytes(), b'Z')
+        chunks.append(b'X')
+        self.assertEqual(rtt.rtt_read()['data'], 'X')
+
+    def test_capture_driver_failure_retains_prefix(self):
+        self.start_rtt()
+        self.probe.rtt_read.side_effect = [b'ABC', RuntimeError('read failure')]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'partial.bin'
+            result = rtt.rtt_capture(0, 5, 1000, path)
+            self.assertFalse(result['success'])
+            self.assertEqual(result['bytes_read'], result['bytes_written'])
+            self.assertEqual(path.read_bytes(), b'ABC')
+
+    def test_rtt_driver_status_only_on_explicit_request(self):
+        self.start_rtt()
+        self.assertTrue(rtt.rtt_get_status()['started'])
+        self.probe.rtt_get_status.assert_not_called()
+        self.probe.rtt_get_status.return_value = Mock(IsRunning=1, NumUpBuffers=2, NumDownBuffers=1,
+                                                      NumBytesRead=100, NumBytesTransferred=96, HostOverflowCount=3)
+        status = rtt.rtt_get_status(include_driver=True)['driver']
+        self.assertEqual(status, dict(running=True, up_buffers=2, down_buffers=1, bytes_from_target=100,
+                                      bytes_to_client=96, host_overflows=3))
 
     def test_rtt_reset_disconnect_and_new_session(self):
         self.start_rtt()

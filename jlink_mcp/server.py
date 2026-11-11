@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 import anyio
 from mcp.server.fastmcp import FastMCP
 
+from . import __version__
 from .api_models import (SessionRequest, ReadRequest, WriteRequest, ControlRequest,
                          InspectRequest, FirmwareRequest, ChannelRequest)
 from .worker import worker
@@ -19,6 +20,8 @@ async def lifespan(_):
 
 
 mcp = FastMCP("jlink-mcp-server", lifespan=lifespan)
+# FastMCP 1.x otherwise advertises the MCP SDK's version during initialize.
+mcp._mcp_server.version = __version__
 
 
 async def call(name, request=None):
@@ -34,41 +37,30 @@ async def discover() -> dict:
 
 @mcp.tool()
 async def session(request: SessionRequest) -> dict:
-    """Open/status/close a single probe session. Open requires explicit chip and serial.
-
-    profile_path can supply chip, architecture, paths, memory regions and speed_khz.
-    Fixed speed requires matching probe readback; status reports the current speed.
-    Optional ELF provides raw symbols and bounded static DWARF types; target
-    matching is unknown until firmware verify_image. Loading never writes debug bits.
-    Use the returned session_id in all subsequent target operations.
+    """Open with a chip and probe serial, optionally supplied by a project profile.
+    Use session_id for target calls. Status reports server_version, connection,
+    speed and ELF match. Run firmware verify_image before typed access.
     """
     return await call("session", request)
 
 
 @mcp.tool()
 async def read(request: ReadRequest) -> dict:
-    """Read/snapshot/diff/sample memory, registers, SVD peripherals and ELF variables.
-
-    action selects read/snapshot/diff/sample. Each batch is <=64KB, sequential,
-    never atomic. live never halts; CPU registers require explicit halt + halted.
-    Variables support global.member[index], including named union members,
-    profiled bounds and matched image by default. Whole unions return opaque
-    bytes; require_match=false marks uncertain interpretation.
-    At most 16 snapshots; expire on reset/Flash/reconnect or eviction. Sampling writes an
-    exclusive JSONL file: <=128 samples, 1MiB raw payload, 10s requested window.
+    """Read/snapshot/diff/sample up to 64 KiB per sequential batch. CPU registers require halt.
+    Typed reads use matched ELF global.member[index] paths. Use compact=true for
+    polling, changes-only diffs or sampling with one copy of the types in JSONL.
+    Snapshots expire on reset, Flash changes, reconnect or eviction (16 slots).
+    Sample creates a new file, up to 128 samples, 1 MiB raw and 10 seconds.
     """
     return await call("read", request)
 
 
 @mcp.tool()
 async def write(request: WriteRequest) -> dict:
-    """Write memory, a register/peripheral, or a typed ELF variable with readback.
-
-    Never auto-halts or retries. Verification can trigger peripheral read side
-    effects. Typed writes require halted consistency, matched image and profiled
-    RAM; select a scalar or fixed 1D scalar array, including named union members.
-    const/atomic and aggregate writes are rejected. Submitted writes invalidate
-    image matching; reverify before further typed access. Use firmware for Flash.
+    """Write one memory span, register, peripheral or typed RAM variable. Use firmware for Flash.
+    Typed writes require a matched ELF and halted CPU. A successful verified typed
+    RAM write preserves the earlier Flash match. Other submissions invalidate it.
+    Readback is optional and can affect peripherals. Writes never auto-halt or retry.
     """
     return await call("write", request)
 
@@ -115,10 +107,10 @@ async def firmware(request: FirmwareRequest) -> dict:
 
 @mcp.tool()
 async def channel(request: ChannelRequest) -> dict:
-    """RTT open/status/read/write/close with bounded waits and actual byte counts.
-
-    Writes retry only unsent suffixes internally; never resend an entire partial
-    command. Reset, firmware modification and disconnect invalidate RTT.
+    """RTT text and binary I/O. Read as text_hex (default), text or base64.
+    Write text or data_b64. bytes_written counts accepted bytes. Capture drains
+    up to size raw bytes to a new file within timeout_ms and preserves partial data.
+    Status reports buffer and host overflow counters from the driver when available.
     """
     return await call("channel", request)
 
@@ -134,7 +126,7 @@ def guide() -> str:
 
 
 def main():
-    logger.info("Starting compact J-Link MCP API 0.6 (stdio)")
+    logger.info("Starting J-Link MCP %s (stdio)", __version__)
     mcp.run(transport="stdio")
 
 

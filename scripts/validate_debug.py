@@ -21,9 +21,11 @@ REPO = Path(__file__).resolve().parents[1]
 APP = Path(r'C:\Users\32196\Desktop\c1_driver\Firmware_app\MDK-ARM\object\dgm_app_fw.axf')
 
 
-async def validate(args):
-    assert args.power_stage_off, 'Intrusive validation requires disabled power output'
-    output = REPO / '.local' / 'validation' / ('debug_' + datetime.now().strftime('%Y%m%d_%H%M%S'))
+async def validate(args, *, exercise_debug=True):
+    if not __debug__ or not args.power_stage_off:
+        raise ValueError('Run without -O and with power output disabled (--power-stage-off)')
+    prefix = 'debug_' if exercise_debug else 'flash_'
+    output = REPO / '.local' / 'validation' / (prefix + datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
     output.mkdir(parents=True)
     elf, binary = output / 'app.axf', output / 'app.bin'
     elf.write_bytes(args.elf.read_bytes())
@@ -32,11 +34,15 @@ async def validate(args):
     segments = [s for s in symbols.elf.iter_segments() if s['p_type'] == 'PT_LOAD']
     assert len(segments) == 1 and segments[0]['p_paddr'] == 0x08000000
     assert segments[0].data() == binary.read_bytes(), 'ELF and BIN do not describe the same load image'
-    assert binary.stat().st_size < 117 * 1024
-    ram_ends = [s['sh_addr'] + s['sh_size'] for s in symbols.elf.iter_sections()
-                if s['sh_flags'] & 2 and 0x20000000 <= s['sh_addr'] < 0x20008000]
-    assert ram_ends and max(ram_ends) <= 0x20007ff0, 'UDF scratch overlaps allocated RAM'
-    assert int.from_bytes(binary.read_bytes()[:4], 'little') <= 0x20007ff0, 'UDF scratch overlaps initial stack top'
+    assert 8 <= binary.stat().st_size <= 115 * 1024, 'App must end before calibration/parameter pages'
+    app = binary.read_bytes()
+    sp, reset = int.from_bytes(app[:4], 'little'), int.from_bytes(app[4:8], 'little')
+    assert 0x20000000 < sp <= 0x20008000 and reset & 1 and 0x08000000 <= reset < 0x08000000 + len(app)
+    if exercise_debug:
+        ram_ends = [s['sh_addr'] + s['sh_size'] for s in symbols.elf.iter_sections()
+                    if s['sh_flags'] & 2 and 0x20000000 <= s['sh_addr'] < 0x20008000]
+        assert ram_ends and max(ram_ends) <= 0x20007ff0, 'UDF scratch overlaps allocated RAM'
+        assert sp <= 0x20007ff0, 'UDF scratch overlaps initial stack top'
     trace, sid = [], None
     def save():
         (output / 'results.json').write_text(json.dumps(trace, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -74,6 +80,7 @@ async def validate(args):
                 async def opening():
                     result = await call('session', dict(action='open', profile_path=str(REPO / 'profiles/c1_driver.json'),
                                                        elf_path=str(elf), serial_number=args.serial))
+                    assert str(result['connection']['data']['device_serial']) == args.serial
                     return result['session_id']
                 async def raw(address, size):
                     result = await target('read', action='read', items=[dict(kind='memory', address=address, size=size, width=32)])
@@ -86,6 +93,10 @@ async def validate(args):
                 original_dbg, backup, changed, passed = None, None, False, False
                 scratch_backup = None
                 try:
+                    cpuid = int.from_bytes(await raw(0xe000ed00, 4), 'little')
+                    dbg_id = int.from_bytes(await raw(0xe0042000, 4), 'little')
+                    assert (cpuid >> 4) & 0xfff == 0xc24 and dbg_id & 0xfff == 0x410, 'Unexpected target ID'
+                    record(check='C1 target identity', passed=True, serial=args.serial, cpuid=hex(cpuid), dbg_id=hex(dbg_id))
                     original_dbg = int.from_bytes(await raw(0xe0042004, 4), 'little')
                     await dbg(original_dbg | 256)
                     halted = await target('control', action='halt', ok=False)
@@ -97,7 +108,6 @@ async def validate(args):
                     assert backup.read_bytes() == second.read_bytes()
                     record(check='double full Flash backup', passed=True, sha256=hashlib.sha256(backup.read_bytes()).hexdigest())
                     # Preserve the unused tail of the last programmed erase page.
-                    app = binary.read_bytes()
                     rounded = (len(app) + 1023) // 1024 * 1024
                     image = output / 'program.bin'
                     image.write_bytes(app + backup.read_bytes()[len(app):rounded])
@@ -112,6 +122,9 @@ async def validate(args):
                     record(check='all Flash outside current BIN preserved before app startup', passed=True)
                     await target('control', action='reset', mode='halt')
                     await target('firmware', action='verify_image')
+                    if not exercise_debug:
+                        passed = True
+                        return output
                     main = await target('control', action='run_until', symbol='main', timeout_ms=3000)
                     assert main['completion'] == 'target_reached' and main['temporary_breakpoint_removed']
                     context = await target('inspect', action='context')

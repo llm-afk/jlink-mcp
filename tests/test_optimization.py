@@ -327,9 +327,60 @@ class OptimizationTests(unittest.TestCase):
         s._invalidate()
         self.assertEqual(s.image_match['status'], 'unknown')
         s.image_match = {'status': 'matched'}
-        with self.assertRaises(Exception):
+        s.probe.halted.return_value = True
+        s.probe.memory_write.side_effect = TimeoutError('driver completion unknown')
+        with self.assertRaises(TimeoutError):
             s.write(m.WriteRequest(session_id='test', item=dict(kind='memory', address=0x20000000, data_hex='01')))
         self.assertEqual(s.image_match['status'], 'unknown')
+
+    def test_compact_sample_plans_once_and_records_fresh_values(self):
+        s = self.service()
+        s.image_match = {'status': 'matched'}
+        s.probe.memory_read.side_effect = [[12], [34]]
+        path = Path(self.temp.name) / 'compact.jsonl'
+        req = m.Sample(action='sample', session_id='test', compact=True, count=2, interval_ms=10,
+                       output_path=str(path), items=[dict(kind='variable', name='counter')])
+        with patch.object(s, '_plan_read', wraps=s._plan_read) as planning:
+            self.assertTrue(s.read(req)['complete'])
+        planning.assert_called_once()
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(rows[0]['types']['0']['kind'], 'unsigned')
+        self.assertNotIn('types', rows[1])
+        data = [row['result']['items'][0]['data'] for row in rows]
+        self.assertTrue(all('type' not in item and item['elf_match'] == 'matched' for item in data))
+        self.assertEqual([(item['value'], item['data_hex']) for item in data], [(12, '0c000000'), (34, '22000000')])
+
+    def test_sample_rechecks_match_on_every_observation(self):
+        s = self.service()
+        s.image_match = {'status': 'matched'}
+        def lose_match(*args, **kwargs):
+            s.image_match = {'status': 'unknown'}
+            return [1]
+        s.probe.memory_read.side_effect = lose_match
+        path = Path(self.temp.name) / 'lost-match.jsonl'
+        result = s.read(m.Sample(action='sample', session_id='test', count=2, interval_ms=10,
+            output_path=str(path), items=[dict(kind='variable', name='counter')]))
+        self.assertFalse(result['success'])
+        final = json.loads(path.read_text().splitlines()[-1])['result']['items'][0]
+        self.assertEqual(final['error']['code'], 'IMAGE_NOT_MATCHED')
+        self.assertNotIn('data', final)
+        s.probe.memory_read.assert_called_once()
+
+    def test_compact_diff_contains_changes_and_failures(self):
+        s = self.service()
+        s.image_match = {'status': 'matched'}
+        s.probe.memory_read.side_effect = [[1], [1], [2], OSError('lost read')]
+        item = dict(kind='variable', name='counter')
+        snap = s.read(m.Snapshot(action='snapshot', session_id='test', compact=True, items=[item]))
+        req = m.Diff(action='diff', session_id='test', snapshot_id=snap['snapshot_id'], compact=True)
+        unchanged = s.read(req)
+        self.assertNotIn('current', unchanged)
+        self.assertEqual(unchanged['changes'], [])
+        changed = s.read(req)['changes'][0]
+        self.assertEqual((changed['item']['name'], changed['before']['value'], changed['after']['value']), ('counter', 1, 2))
+        failed = s.read(req)
+        self.assertFalse(failed['success'])
+        self.assertEqual(failed['changes'][0]['status'], 'unavailable')
 
     def test_profile_speed_inherited_and_can_be_overridden(self):
         path = Path(self.temp.name) / 'speed-profile.json'

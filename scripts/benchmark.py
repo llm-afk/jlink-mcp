@@ -24,7 +24,7 @@ def summary(times):
 
 def offline(elf_path, profile_path, output):
     from jlink_mcp.symbols import SymbolFile
-    from jlink_mcp.target_access import read_bytes
+    from jlink_mcp.target_access import read_bytes, write_bytes
     from jlink_mcp.image_match import compare_image
     from jlink_mcp.profiles import load_profile
     elf = SymbolFile(str(elf_path))
@@ -40,12 +40,17 @@ def offline(elf_path, profile_path, output):
             times.append((time.perf_counter() - start) * 1000 / count)
         cases[name] = summary(times)
         print(name, round(cases[name]['median_ms'], 4), 'ms', flush=True)
+    raw = bytes(range(256)) * 256
+    def accept_write(address, units, nbits):
+        return len(units) * (nbits // 8)
     for width in (8, 16, 32):
         values = list(range(65536 // (width // 8)))
         if width == 8:
             values = [v & 255 for v in values]
         probe = SimpleNamespace(memory_read=lambda *args, values=values, **kwargs: values)
         measure('convert_64k_' + str(width), lambda: read_bytes(probe, 0, 65536, width), 30)
+        sink = SimpleNamespace(memory_write=accept_write)
+        measure('pack_write_64k_' + str(width), lambda: write_bytes(sink, 0, raw, width), 30)
     for name in ('MotorControl', 'MotorControl.Iq', 'MotorControl.PID_Iq.kp'):
         measure('resolve_' + name, lambda name=name: elf.variable(name))
     measure('readonly_sections', elf.readonly_sections)
@@ -99,6 +104,9 @@ async def hardware(args, metadata):
                     for name in ('MotorControl', 'MotorControl.Iq', 'MotorControl.PID_Iq.kp'):
                         request = dict(action='read', items=[dict(kind='variable', name=name)])
                         cases.update(await run_case(call, sid, 'typed_' + name, 'read', request, args.count))
+                        if name == 'MotorControl':
+                            cases.update(await run_case(call, sid, 'typed_MotorControl_compact', 'read',
+                                                        dict(request, compact=True), args.count))
                     cases.update(await run_case(call, sid, 'verify_image', 'firmware', dict(action='verify_image'), args.count))
                     metadata['final'] = await call('session', dict(action='status'))
                     assert metadata['final']['meta']['cpu_after'] == 'running'

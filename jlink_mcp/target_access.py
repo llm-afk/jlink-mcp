@@ -37,7 +37,11 @@ def aligned_width(address, size):
 
 def write_bytes(jlink, address, data, width=8):
     unit = validate_span(address, len(data), width)
-    values = [int.from_bytes(data[i:i+unit], 'little') for i in range(0, len(data), unit)]
+    if unit == 1:
+        values = list(data)
+    else:
+        code = 'H' if unit == 2 else 'I'
+        values = list(struct.unpack(f'<{len(data) // unit}{code}', data))
     # pylink memory_write returns the DLL byte count, even with nbits set.
     written = jlink.memory_write(address, values, nbits=width)
     if written != len(data):

@@ -85,6 +85,7 @@ class ReadBatch(Bound):
     action: Literal["read"]
     items: Items
     consistency: Literal["live", "halted"] = "live"
+    compact: bool = Field(default=False, description="Keep raw bytes and values, omit per-item DWARF layouts. Sample records layouts once.")
 
 
 class MemoryWrite(Request):
@@ -233,6 +234,7 @@ class Snapshot(ReadBatch):
 class Diff(Bound):
     action: Literal["diff"]
     snapshot_id: Name
+    compact: bool = Field(default=False, description="Return only changed or unavailable items.")
 
 
 class Sample(ReadBatch):
@@ -294,20 +296,36 @@ class ChannelRead(Bound):
     buffer_index: Annotated[int, Field(ge=0, le=255)] | None = None
     size: Size = 1024
     timeout_ms: Annotated[int, Field(ge=0, le=30000)] = 0
+    format: Literal["text_hex", "text", "base64"] = "text_hex"
+
+
+class ChannelCapture(Bound):
+    action: Literal["capture"]
+    buffer_index: Annotated[int, Field(ge=0, le=255)] | None = None
+    size: Annotated[int, Field(ge=1, le=16 * 1024 * 1024)]
+    timeout_ms: Annotated[int, Field(ge=1, le=30000)]
+    output_path: Annotated[str, Field(min_length=1)]
 
 
 class ChannelWrite(Bound):
     action: Literal["write"]
     buffer_index: Annotated[int, Field(ge=0, le=255)] | None = None
-    text: Annotated[str, Field(max_length=65536)]
+    text: Annotated[str, Field(max_length=65536)] | None = None
+    data_b64: Annotated[str, Field(min_length=4, max_length=87384)] | None = None
     timeout_ms: Annotated[int, Field(ge=0, le=30000)] = 1000
+
+    @model_validator(mode="after")
+    def one_payload(self):
+        if (self.text is None) == (self.data_b64 is None):
+            raise ValueError("Provide exactly one of text or data_b64")
+        return self
 
 
 class ChannelState(Bound):
     action: Literal["status", "close"]
 
 
-ChannelRequest = Annotated[Union[ChannelOpen, ChannelRead, ChannelWrite, ChannelState], Field(discriminator="action")]
+ChannelRequest = Annotated[Union[ChannelOpen, ChannelRead, ChannelCapture, ChannelWrite, ChannelState], Field(discriminator="action")]
 
 
 # The worker and service use the same public request registry.

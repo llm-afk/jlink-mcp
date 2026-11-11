@@ -1,4 +1,4 @@
-# J-Link MCP 0.6.2
+# J-Link MCP 0.6.3
 
 面向嵌入式调试任务的 MCP 服务。对外提供 **8 个工具**：读取与采集统一到 read，执行控制与断点统一到 control。J-Link DLL、ELF 符号解析和 SVD 是内部实现。0.6 调整了工具名与读取请求，升级后需重载 MCP 客户端；迁移见 [迁移说明](docs/MIGRATION.md)。
 
@@ -31,7 +31,7 @@ SDK 固定兼容范围 `mcp>=1.26.0,<2`；MCP 2.x 更改了 FastMCP API。ELF �
 | control | halt / resume / reset / step / wait / run_until / breakpoint_set / breakpoint_remove / breakpoint_list |
 | inspect | symbol / variable / preflight / svd / context / fault |
 | firmware | verify_image / program / verify / backup / erase_pages / erase_chip |
-| channel | RTT open / status / read / write / close |
+| channel | RTT open / status / read / write / capture / close |
 
 使用提示是 `debug://guide` 资源，不占工具列表。
 
@@ -109,7 +109,7 @@ read 负责观测和记录，control 负责执行状态与断点生命周期；w
 
 支持具有固定地址的全局变量、嵌套结构体、具名 union 成员、连续定长数组、整数、浮点、布尔和枚举。`global.member[index]` 是唯一选择语法；指针只显示地址，不解引用。读取整个 union 时返回 `{"data_hex":"...","active_member":null}` 和成员名称列表；选择 `packet.payload.u32`、`packet.payload.bytes[3]` 等明确路径后才按选定成员解析，不推断哪个分支有效。拒绝局部变量、动态位置、函数调用、位域、匿名成员自动展开、动态/跨步数组等未支持类型。单对象最大 64KB，数组最多 4096 元素，类型深度最多 16，解码值树最多 8192 节点。返回值同时保留原始字节；NaN/Infinity 用字符串表达，保持合法 JSON。
 
-read 的 snapshot/sample 直接复用 variable。运行中的多变量或结构体读取不保证一致时刻。显式写入、复位、Flash 修改尝试和连接失效会清除映像匹配证据；外部工具或目标自行改写 Flash 无法自动检测，必要时重新 verify_image。
+read 的 snapshot/sample 直接复用 variable。运行中的多变量或结构体读取不保证一致时刻。复位、Flash 修改尝试和连接失效会清除映像匹配证据。外部工具或目标自行改写 Flash 时需要重新 verify_image。
 
 ## 类型化变量写入（0.6.2）
 
@@ -123,7 +123,7 @@ read 的 snapshot/sample 直接复用 variable。运行中的多变量或结构�
 
 支持整数、有限浮点、布尔、枚举、指针地址值及一维定长标量数组。枚举可传精确名称或范围内整数；布尔只接受 true/false，数组必须提供完整长度。整数溢出、非有限浮点和类型不符均在写入前拒绝。只能写选定标量或数组，不整块覆盖结构体/union，不填充 padding，也不解引用指针。`packet.payload.bytes` 可传完整字节数组，写一个元素则使用 `packet.payload.bytes[3]`。
 
-请求只提交所选范围一次，`verify=true` 按原范围读回，返回地址、类型、ELF SHA256、编码字节和提交值；校验不符或完成未知时不自动重试。提交写入会清除映像匹配证据，下一次默认类型读取或类型写入前需重新 `firmware verify_image`。CPU 暂停不保证 DMA 静止；本接口不提供原子多变量事务。升级后需重载 MCP 服务并刷新工具 schema，对外仍为 8 个工具。
+请求只提交所选范围一次。`verify=true` 按原范围读回，结果包含地址、类型、ELF SHA256、编码字节和提交值。从 0.6.3 开始，类型化写入完全落在配置的 RAM 内，读回一致且 CPU 仍暂停时，可以继续使用同一会话、ELF 和配置此前取得的只读 Flash 校验证据和时间戳。返回的 `elf_match_after` 表示下一次类型访问能否直接继续。其他已提交的写入会清除匹配证据，完成未知时须先检查目标状态。CPU 暂停期间 DMA 仍可能活动。
 
 ## 等待、现场定位和数据观察点（0.5）
 
@@ -163,11 +163,13 @@ read 的 snapshot/sample 直接复用 variable。运行中的多变量或结构�
 
 ## 快照与有限采样
 
-`read snapshot` 使用与 `read read` 相同的 items/consistency，返回 snapshot_id。`read diff` 将该快照与现在比较；原快照保持不变。最多保留 16 个，超出淘汰最早项。
+`read snapshot` 使用与 `read read` 相同的 items/consistency，返回 snapshot_id。`read diff` 将该快照与现在比较。最多保留 16 个，超出淘汰最早项。
+
+轮询变量时可以传 `compact=true`。read/snapshot 保留数值、原始字节、地址和匹配状态，省去逐项的 DWARF 类型描述。sample 的 JSONL 仍为每次观测一行，首行的 `types` 按 item 下标保存一次类型。diff 的精简模式只返回变化和读取失败的项，包含 item 及前后证据。省略 compact 使用原有完整格式。
 
 `read sample` 使用相同 items，外加 `count`、`interval_ms`、可选 `output_path`。最多 128 次、1MiB 原始载荷和 10 秒请求窗口；单次底层驱动阻塞可能延长实际时长。默认文件在当前目录 `captures/`，JSONL 含原始结果、会话及主机时间，不覆盖已有文件。主机时间不是 MCU 精确采样时间，不能用于声称验证了高速电流环时序。
 
-以下三个请求均发给 read；diff 只接收 session_id/action/snapshot_id，不重复传 items：
+以下三个请求均发给 read。diff 从快照取得 items，可选 `compact=true`。
 
 ```json
 {"request":{"session_id":"返回的ID","action":"snapshot","items":[{"kind":"memory","address":536870912,"size":16}]}}
@@ -186,7 +188,22 @@ read 的 snapshot/sample 直接复用 variable。运行中的多变量或结构�
 - erase_pages：必须显式提供页大小，地址必须页对齐；不会向下取整。页大小须与真实芯片匹配，实际擦除仍由 J-Link 算法决定。
 - erase_chip：必须显式 `confirm_chip` 等于会话 chip；包含 bootloader/app，绝不能用于范围擦除的回退。
 - Flash 算法可能改变 CPU 状态，结果报告实际状态；不承诺恢复操作前状态。
-- RTT 沿用部分发送补发和 UTF-8 增量解码；默认读取立即返回，等待最长 30 秒。复位、Flash 修改、断连后重新 open。
+
+固件初始化 SEGGER RTT 后，调用 `channel open`。已知控制块地址时可传 `block_address`。用 `status.driver` 查看驱动发现的上下行缓冲区数量、传输字节数和主机溢出计数。复位、Flash 修改或断连后重新 open。
+
+| 操作 | 用法 |
+|---|---|
+| 看日志 | `read` 默认返回 UTF-8 文本和十六进制。传 `format="text"` 只返回文本，连续读取可拼接跨包字符。默认立即轮询，`timeout_ms` 可指定等待首批数据的时间。 |
+| 读写二进制 | `read` 传 `format="base64"` 后从 `data_b64` 取原始字节。写入时提供 `data_b64` 或 `text`，单次最多 64 KiB。部分写入后继续发送未提交的后缀，失败时 `bytes_written` 是驱动已确认的字节数。目标是否已处理数据须由应用协议确认。 |
+| 录制数据流 | `capture` 把最多 16 MiB 写入服务端新文件，等待上限 30 秒。返回 `bytes_written`、`sha256` 和 `complete`。超时保留已采集的前缀并返回 `timed_out=true`。已存在的文件会在消费通道数据前被拒绝。 |
+
+例如，将上行通道 0 的 64 KiB 数据保存到服务端当前目录下的新文件中。
+
+```json
+{"request":{"action":"capture","session_id":"返回的ID","buffer_index":0,"size":65536,"timeout_ms":3000,"output_path":"rtt-current.bin"}}
+```
+
+RTT 通道提供字节流。读取或采集会消费所选通道的数据，应用协议负责帧边界。连续文本读取之间如果消费了二进制数据，该通道的 UTF-8 解码状态会重新开始。
 
 ## 架构和当前范围
 
@@ -200,7 +217,7 @@ read 的 snapshot/sample 直接复用 variable。运行中的多变量或结构�
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-保留全部 114 项回归测试，覆盖严格请求模型、驱动隔离、会话状态、Flash/RTT、DWARF、等待/观察点与异常现场。实板结果和清理说明见 [验证记录](docs/VALIDATION.md)。
+离线回归覆盖严格请求模型、驱动隔离、会话状态、Flash/RTT、DWARF、采样、等待/观察点与异常现场。实板结果和清理说明见 [验证记录](docs/VALIDATION.md)。
 
 只读实板复验（不暂停、不复位、不烧录）：
 
@@ -208,7 +225,13 @@ read 的 snapshot/sample 直接复用 variable。运行中的多变量或结构�
 .\.venv\Scripts\python.exe scripts/validate_readonly.py --serial 174504233
 ```
 
-`scripts/validate_debug.py` 用于完整侵入性测试，需要明确传入 `--power-stage-off`，会备份、烧录当前 App 并注入可控故障；见验证记录。
+C1 开发板的独立烧录入口使用编译得到的 AXF 和同名原始 BIN。确认电机功率输出已关闭后运行，`--elf` 可指定其他构建目录。
+
+```powershell
+.\.venv\Scripts\python.exe scripts/flash_c1.py --serial 174504233 --power-stage-off
+```
+
+脚本核对目标 ID 和 ELF/BIN，双读备份 128 KiB Flash，保留最后一个编程页的尾部，校验整个应用和范围外字节，恢复 DBG_CTL 后运行应用。证据写入 `.local/validation/flash_*/`。完整断点、观察点和故障注入测试使用 `scripts/validate_debug.py`。
 
 ## 目录
 
