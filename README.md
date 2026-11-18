@@ -1,4 +1,4 @@
-# J-Link MCP 0.7.2
+# J-Link MCP 0.7.3
 
 面向嵌入式调试任务的 MCP 服务。对外提供 **8 个工具**：读取与采集统一到 read，执行控制与断点统一到 control。J-Link DLL、ELF 符号解析和 SVD 是内部实现。0.6 调整了工具名与读取请求，升级后需重载 MCP 客户端；迁移见 [迁移说明](docs/MIGRATION.md)。
 
@@ -27,7 +27,7 @@ SDK 固定兼容范围 `mcp>=1.26.0,<2`；MCP 2.x 更改了 FastMCP API。ELF �
 | discover | 枚举探针、可用 SVD、能力边界，不连接目标 |
 | session | open / status / close |
 | read | read / snapshot / diff / sample；hss 用探针高速采集运行中的 RAM 标量 |
-| write | 单次 memory / register / peripheral / variable 写入，可显式校验 |
+| write | memory / register / peripheral / variable 写入，variables 成组调参并回读 |
 | control | halt / resume / reset / step / wait / run_until / continue_to / breakpoint_set / breakpoint_remove / breakpoint_list |
 | inspect | find_symbol / symbol / variable / preflight / svd / context / fault |
 | firmware | verify_image / program / verify / backup / erase_pages / erase_chip |
@@ -157,6 +157,14 @@ read 的 snapshot/sample 直接复用 variable。运行中的多变量或结构�
 ```
 
 `write.continue_to` 只接受已暂停时的类型化 RAM 写入。写前检查断点和观察项，写后回读匹配才继续执行。同一回复的 `verification` 描述写入，`continue_to.completion` 描述停机位置，`continue_to.stop.read` 给出该处的值。后续超时或读失败时应保留已确认的写入结果，避免重复提交。默认超时会暂停，传 `on_timeout="running"` 可让目标继续运行。命中目标后 CPU 保持暂停。
+
+成组调参使用同一个 `write`。下面是请求形状，数值仅供示例。首次命中断点时可以用 `read_on_stop` 一并保存原值，结束时用原值再发一次组写并校验。
+
+```json
+{"request":{"session_id":"会话ID","item":{"kind":"variables","values":{"MotorControl.PID_Iq.kp":0.5,"MotorControl.PID_Iq.ki":0.01}},"verify":true,"continue_to":{"breakpoint_id":"断点ID","read_on_stop":["MotorControl.PID_Iq.kp","MotorControl.PID_Iq.ki","MotorControl.Iq"]}}}
+```
+
+`values` 接受 1–16 个标量路径，须有匹配的 ELF、已暂停的 CPU 及 `verify=true`。服务写前检查全部类型和地址，拒绝地址重叠的成员。同一 RAM 区域中相邻且访问宽度一致的字段合并写入并回读。各段按地址顺序处理，出现错误或回读不符就停止。回复中的 `parameters` 按路径给出即时校验状态、读回值及原始字节。部分提交时，先查看 `matched / mismatch / unknown / not_submitted` 及目标现状再决定如何恢复。各段均匹配后才会执行可选的 `continue_to`。
 
 `control wait` 只等待 CPU 停止，最长 30 秒，不继续、不暂停、不复位。返回停止原因（调试请求、代码断点、数据观察点或向量捕获）、原始原因码和 PC/LR/SP/XPSR；原因读取失败会保留错误，不推断原因。
 

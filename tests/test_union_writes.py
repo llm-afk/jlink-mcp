@@ -55,6 +55,85 @@ class UnionWriteTests(unittest.TestCase):
         return self.service.invoke('write', m.WriteRequest(session_id='test',
             item=dict(kind='variable', name=name, value=value), **options))
 
+    def write_group(self, values, **options):
+        return self.service.invoke('write', m.WriteRequest(session_id='test', verify=True,
+            item=dict(kind='variables', values=values), **options))
+
+    def test_group_coalesces_adjacent_scalars_and_decodes_exact_readback(self):
+        proof = self.match_image()
+        self.probe.memory_read.reset_mock()
+        a, b = 'packet.payload.pair.a', 'packet.payload.pair.b'
+        original = bytes(self.ram)
+        result = self.write_group({b: 1.25, a: -4})
+        self.assertTrue(result['success'], result)
+        self.assertEqual(result['parameters'][a]['observed'], -4)
+        self.assertEqual(result['parameters'][b]['observed_hex'], struct.pack('<f', 1.25).hex())
+        self.probe.memory_write.assert_called_once_with(0x20000044, [0xfffffffc, 0x3fa00000], nbits=32)
+        self.probe.memory_read.assert_called_once_with(0x20000044, 2, nbits=32)
+        self.assertEqual(self.ram[:0x44]+self.ram[0x4c:], original[:0x44]+original[0x4c:])
+        self.assertIs(self.service.image_match, proof)
+
+    def test_group_preflights_aliases_invalid_and_readonly_members(self):
+        self.match_image()
+        for values in [{'packet.payload.real': 1.5, 'packet.payload.u32': 2},
+                       {'counter': 2, 'readonly_packet.payload.u32': 0},
+                       {'counter': 2, 'packet.payload.flag': 7}]:
+            result = self.write_group(values)
+            self.assertFalse(result['submitted'])
+        self.probe.memory_write.assert_not_called()
+
+    def test_group_partial_write_reports_uncertain_and_unsubmitted_fields(self):
+        self.match_image()
+        put = self.write_memory
+        def fail_second(address, values, nbits):
+            if address == 0x20000044:
+                raise OSError('uncertain submission')
+            return put(address, values, nbits)
+        self.probe.memory_write.side_effect = fail_second
+        self.service.breakpoints['tick'] = dict(kind='execute', address=0x08000010)
+        result = self.write_group({'counter': 5, 'packet.payload.u32': 7, 'packet.trailer': 8},
+                                  continue_to=dict(breakpoint_id='tick'))
+        self.assertFalse(result['success'])
+        self.assertEqual([p['verification'] for p in result['parameters'].values()], ['matched','unknown','not_submitted'])
+        self.assertEqual(result['continue_to']['completion'], 'not_submitted')
+        self.assertFalse(result['retry_safe'])
+        self.assertEqual(self.service.image_match['status'], 'unknown')
+        self.assertEqual(self.probe.memory_write.call_count, 2)
+        self.probe.restart.assert_not_called()
+
+    def test_group_one_mismatch_blocks_continuation(self):
+        self.match_image()
+        self.service.breakpoints['tick'] = dict(kind='execute', address=0x08000010)
+        self.probe.memory_read.side_effect = lambda *a, **kw: [4,0]
+        result = self.write_group({'packet.payload.pair.a': 4, 'packet.payload.pair.b': 1.25},
+                                  continue_to=dict(breakpoint_id='tick'))
+        self.assertEqual(result['verification'], 'mismatch')
+        self.assertEqual(result['parameters']['packet.payload.pair.a']['verification'], 'matched')
+        self.assertEqual(result['parameters']['packet.payload.pair.b']['observed'], 0.0)
+        self.assertEqual(result['continue_to']['completion'], 'not_submitted')
+        self.probe.restart.assert_not_called()
+
+    def test_group_speed_drift_stops_before_next_disjoint_write(self):
+        self.match_image()
+        self.service.target['requested_speed_khz'] = self.probe.speed = 10000
+        def drift(*args, **kwargs):
+            self.probe.speed = 2000
+            return self.write_memory(*args, **kwargs)
+        self.probe.memory_write.side_effect = drift
+        result = self.write_group({'counter': 3, 'packet.trailer': 7})
+        self.assertEqual(result['error']['code'], 'SPEED_MISMATCH')
+        self.assertEqual(result['parameters']['counter']['verification'], 'matched')
+        self.assertEqual(result['parameters']['packet.trailer']['verification'], 'not_submitted')
+        self.assertEqual(result['elf_match_after'], 'unknown')
+        self.probe.memory_write.assert_called_once()
+
+    def test_group_contract_requires_bounded_halted_verified_scalars(self):
+        for values, verify, consistency in [({},True,'halted'), ({'x':1},False,'halted'),
+                ({'x':1},True,'live'), ({'x':[1]},True,'halted'), ({str(i):i for i in range(17)},True,'halted')]:
+            with self.assertRaises(ValidationError):
+                m.WriteRequest(session_id='test', verify=verify, consistency=consistency,
+                               item=dict(kind='variables', values=values))
+
     def match_image(self):
         def target_read(address, count, nbits=8):
             if address == 0x08000000 and count == 1 and nbits == 32:

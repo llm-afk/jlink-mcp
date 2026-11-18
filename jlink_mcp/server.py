@@ -61,7 +61,10 @@ async def read(request: ReadRequest) -> dict:
 
 @mcp.tool()
 async def write(request: WriteRequest) -> dict:
-    """Write one memory span, register, peripheral or typed RAM variable. Use firmware for Flash.
+    """Write a memory span, register, peripheral, typed RAM variable or group of scalar parameters.
+    To tune kp and ki together use item={kind:"variables",values:{path:value,...}}, verify=true,
+    and optionally continue_to. Each parameter reports its verification and observed value.
+    Groups require halt, preflight all paths, and only continue after every readback matches.
     Typed writes require a matched ELF and halted CPU. A successful verified typed
     RAM write preserves the earlier Flash match. Other submissions invalidate it.
     Readback is optional and can affect peripherals. Writes never auto-halt or retry.

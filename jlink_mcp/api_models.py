@@ -126,7 +126,13 @@ class VariableWrite(Request):
         description="Scalar or exact-length 1D scalar array; enum accepts an exact name or integer; no struct/union objects")
 
 
-WriteItem = Annotated[Union[MemoryWrite, RegisterWrite, PeripheralWrite, VariableWrite], Field(discriminator="kind")]
+class VariableGroupWrite(Request):
+    kind: Literal["variables"]
+    values: Annotated[dict[Name, ScalarValue], Field(min_length=1, max_length=16,
+        description="Map 1–16 distinct typed scalar RAM paths to new values. Requires verify=true and halted consistency.")]
+
+
+WriteItem = Annotated[Union[MemoryWrite, RegisterWrite, PeripheralWrite, VariableWrite, VariableGroupWrite], Field(discriminator="kind")]
 
 
 class ContinueTo(Request):
@@ -144,7 +150,9 @@ class WriteRequest(Bound):
 
     @model_validator(mode="after")
     def continuation_requires_verified_variable(self):
-        if self.continue_to and (self.item.kind != "variable" or not self.verify or self.consistency != "halted"):
+        if self.item.kind == "variables" and (not self.verify or self.consistency != "halted"):
+            raise ValueError("Grouped variables require verify=true and halted consistency")
+        if self.continue_to and (self.item.kind not in ("variable", "variables") or not self.verify or self.consistency != "halted"):
             raise ValueError("continue_to requires a typed variable, verify=true and halted consistency")
         return self
 

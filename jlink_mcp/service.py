@@ -1,8 +1,7 @@
 """Serialized debug sessions behind the compact MCP API.
 
-This layer owns session identity and observation semantics. Only control and
-firmware operations may deliberately change execution state. Driver calls are
-never automatically retried after an uncertain result.
+This layer owns session identity, observation semantics and explicit execution
+control. Driver calls are never automatically retried after an uncertain result.
 """
 import copy
 import hashlib
@@ -12,6 +11,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 from . import __version__, api_models as contracts
 from .gdb_server import gdb_server_manager
@@ -36,6 +36,14 @@ class ServiceError(Exception):
 
 class WriteNotSubmitted(Exception):
     """The cause occurred before any driver write was submitted."""
+
+
+class ParameterWrite(NamedTuple):
+    name: str
+    address: int
+    data: bytes
+    width: int
+    schema: dict
 
 
 def utc_now():
@@ -130,7 +138,7 @@ class DebugService:
             except Exception as exc:
                 rejected = isinstance(exc, WriteNotSubmitted)
                 failure = error_result(exc.__cause__ if rejected else exc)
-                if method == "write" and "continue_to" in result:
+                if method == "write" and ("continue_to" in result or "parameters" in result):
                     # A final speed check can fail after the verified write has already completed.
                     result.update(failure, elf_match_after=self.image_match["status"])
                 else:
@@ -149,7 +157,7 @@ class DebugService:
 
     def capabilities(self):
         return {"backend": "jlink-dll", "read_kinds": ["memory", "register", "peripheral", "symbol", "variable"],
-                "write_kinds": ["memory", "register", "peripheral", "variable"],
+                "write_kinds": ["memory", "register", "peripheral", "variable", "variables"],
                 "elf": "32-bit little-endian ET_EXEC; static DWARF globals/members/fixed arrays",
                 "typed_write": "halted, matched ELF, profiled RAM; scalar or fixed 1D scalar array; named union paths",
                 "execution_debug": self.target is not None and self.target["architecture"] == "cortex-m",
@@ -502,14 +510,46 @@ class DebugService:
         return address, data, width, variable
 
     def write(self, request):
-        item = request.item
-        variable = None
-        try:
-            if request.continue_to:
+        if request.continue_to:
+            try:
                 destination = self._owned_execution_address(request.continue_to.breakpoint_id)
                 plans = [self._plan_read(watch) for watch in request.continue_to.read_on_stop or []]
                 if sum(plan["bytes"] for plan in plans) > 65536:
                     raise ServiceError("LIMIT", "Total stop read size must not exceed 64KB")
+            except Exception as exc:
+                raise WriteNotSubmitted(str(exc)) from exc
+        if request.item.kind == "variables":
+            result = self._write_parameters(request.item.values)
+        else:
+            result = self._write_one(request)
+        if not request.continue_to:
+            return result
+        result["retry_safe"] = False
+        if not result["success"]:
+            result["continue_to"] = {"success": False, "completion": "not_submitted"}
+            return result
+        try:
+            self._require_image_match()
+            self._verify_speed()
+            follow = self._continue_to(request.continue_to, destination, plans)
+        except Exception as exc:
+            follow = {**error_result(exc), "completion": "not_submitted"}
+        result["continue_to"] = follow
+        result["elf_match_after"] = self.image_match["status"]
+        result["success"] = follow["success"] and follow.get("stop", {}).get("read", {}).get("success", True)
+        return result
+
+    def _restore_ram_image_match(self, previous_match):
+        # A verified write wholly within profiled RAM preserves immutable Flash evidence.
+        if (previous_match.get("generation") == self.generation
+                and previous_match.get("elf_sha256") == self.symbols.sha256
+                and previous_match.get("profile") == self.profile_identity):
+            self.image_match = previous_match
+
+    def _write_one(self, request):
+        item = request.item
+        variable = None
+        try:
             if item.kind in ("register", "variable") and request.consistency != "halted":
                 raise ServiceError("REQUIRES_HALT", "Register and typed writes require halted consistency")
             if request.consistency == "halted":
@@ -538,29 +578,72 @@ class DebugService:
                   "verification": "matched" if matched else "mismatch" if matched is False else "not_requested",
                   "observed": observed, "state_preserved": stable}
         if variable is not None:
-            # verify_image covers immutable Flash only. Keep the original proof
-            # and timestamp after a verified write wholly in a distinct profile RAM region.
-            if (matched and stable and previous_match.get("generation") == self.generation
-                    and previous_match.get("elf_sha256") == self.symbols.sha256
-                    and previous_match.get("profile") == self.profile_identity):
-                self.image_match = previous_match
+            if matched and stable:
+                self._restore_ram_image_match(previous_match)
             result.update(variable={**variable, "elf_sha256": self.symbols.sha256},
                           data_hex=data.hex(), value=decode(variable["type"], data),
                           elf_match_after=self.image_match["status"])
-        if request.continue_to:
-            result["retry_safe"] = False
-            if not result["success"]:
-                result["continue_to"] = {"success": False, "completion": "not_submitted"}
-                return result
-            try:
-                self._require_image_match()
-                self._verify_speed()
-                follow = self._continue_to(request.continue_to, destination, plans)
-            except Exception as exc:
-                follow = {**error_result(exc), "completion": "not_submitted"}
-            result["continue_to"] = follow
-            result["elf_match_after"] = self.image_match["status"]
-            result["success"] = follow["success"] and follow.get("stop", {}).get("read", {}).get("success", True)
+        return result
+
+    def _parameter_blocks(self, values):
+        fields = []
+        for name, value in values.items():
+            item = contracts.VariableWrite(kind="variable", name=name, value=value)
+            address, data, width, info = self._plan_memory_write(item, verify=True)
+            fields.append(ParameterWrite(name, address, data, width, info["type"]))
+        blocks = []
+        end = 0
+        for field in sorted(fields, key=lambda f: f.address):
+            if field.address < end:
+                raise ServiceError("OVERLAPPING_PARAMETERS", f"{field.name} overlaps another requested parameter")
+            field_end = field.address + len(field.data)
+            if (blocks and field.address == end and blocks[-1][0].width == field.width and
+                    self._in_memory(blocks[-1][0].address, field_end - blocks[-1][0].address, ram_only=True)):
+                blocks[-1].append(field)
+            else:
+                blocks.append([field])
+            end = field_end
+        return blocks
+
+    def _write_parameters(self, values):
+        try:
+            self._halted()
+            blocks = self._parameter_blocks(values)
+            self._halted()
+        except Exception as exc:
+            raise WriteNotSubmitted(str(exc)) from exc
+
+        receipts = {name: {"verification": "not_submitted"} for name in values}
+        result = {"success": False, "submitted": True, "retry_safe": False, "parameters": receipts,
+                  "verification": "unknown", "atomic": False}
+        previous_match = self.image_match
+        self.image_match = {"status": "unknown", "reason": "grouped RAM write submitted"}
+        try:
+            for index, block in enumerate(blocks):
+                if index:
+                    self._verify_speed()
+                    self._halted()
+                first = block[0]
+                data = b"".join(field.data for field in block)
+                for field in block:
+                    receipts[field.name].update(verification="unknown", address=field.address, data_hex=field.data.hex())
+                write_bytes(self.probe, first.address, data, first.width)
+                actual = read_bytes(self.probe, first.address, len(data), first.width)
+                self._halted()
+                for field in block:
+                    offset = field.address - first.address
+                    observed = actual[offset:offset + len(field.data)]
+                    receipts[field.name].update(verification="matched" if observed == field.data else "mismatch",
+                                                observed_hex=observed.hex(), observed=decode(field.schema, observed))
+                if actual != data:
+                    result["verification"] = "mismatch"
+                    break
+            else:
+                self._restore_ram_image_match(previous_match)
+                result.update(success=True, verification="matched")
+        except Exception as exc:
+            result.update(error_result(exc))
+        result["elf_match_after"] = self.image_match["status"]
         return result
 
     def _cortex_m(self):
