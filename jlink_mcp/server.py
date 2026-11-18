@@ -75,6 +75,8 @@ async def control(request: ControlRequest) -> dict:
     aligned address+size (1/2/4 bytes) or a matched variable. No Flash fallback.
     wait only observes. run_until requires halt, cleans its temporary breakpoint,
     and selects halt/running on_timeout. Stops report reasons and PC/LR/SP/XPSR.
+    Pass read_on_stop to wait/run_until to collect variables at the observed stop
+    in the same call. Check completion and stop.read.success independently.
     Function symbols require matched image evidence. No automatic retry/reset.
     Reset invalidates snapshots/RTT and removes owned breakpoints.
     """

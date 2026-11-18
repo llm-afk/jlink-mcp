@@ -44,6 +44,62 @@ class DebugExtensionTests(unittest.TestCase):
         self.assertEqual(result['stop']['reasons'][0]['name'], 'code_breakpoint')
         self.assertEqual(result['stop']['registers']['PC'], 0x08000100)
 
+    def test_until_reads_matched_adjacent_variables_in_one_transfer(self):
+        self.s.symbols = Mock()
+        self.s.symbols.variable.side_effect = lambda name: dict(
+            address=0x20000000 + 4 * int(name[-1]), size=4, type=dict(kind='signed', size=4))
+        self.s.image_match = dict(status='matched')
+        self.p.memory_read.return_value = [2, 0xffffffff]
+        self.p.restart.side_effect = lambda: self.regs.update({'R15 (PC)': 0x08000200})
+        result = self.until(read_on_stop=['signal0', 'signal1'])
+        self.assertEqual(result['completion'], 'target_reached')
+        self.assertTrue(result['temporary_breakpoint_removed'])
+        read = result['stop']['read']
+        self.assertTrue(read['success'])
+        self.assertEqual([v['data']['value'] for v in read['items']], [2, -1])
+        self.assertNotIn('type', read['items'][0]['data'])
+        self.p.memory_read.assert_called_once_with(0x20000000, 2, nbits=32)
+        self.p.restart.assert_called_once()
+
+    def test_wait_read_failure_preserves_stop(self):
+        result = self.s.control(m.WaitControl(action='wait', session_id='s', read_on_stop=['missing']))
+        self.assertTrue(result['success'])
+        self.assertEqual(result['completion'], 'observed_halted')
+        self.assertEqual(result['stop']['read']['items'][0]['error']['code'], 'IMAGE_NOT_MATCHED')
+        self.p.memory_read.assert_not_called()
+
+    def test_read_on_stop_timeout_policy(self):
+        items = [dict(kind='memory', address=0x20000000, size=1)]
+        self.p.memory_read.return_value = [42]
+        with patch.object(self.s, '_wait_halt', return_value=False):
+            running = self.until(read_on_stop=items, on_timeout='running')
+        self.assertEqual(running['completion'], 'timeout')
+        self.assertNotIn('stop', running)
+        self.p.memory_read.assert_not_called()
+        with patch.object(self.s, '_wait_halt', side_effect=[False, True]):
+            stopped = self.until(read_on_stop=items, on_timeout='halt')
+        self.assertEqual(stopped['completion'], 'timeout')
+        self.assertFalse(stopped['success'])
+        self.assertEqual(stopped['stop']['read']['items'][0]['data']['data_hex'], '2a')
+
+    def test_multi_read_separates_regions_gaps_duplicates_and_raw_reads(self):
+        self.s.profile = ProjectProfile(name='test', chip='test', regions=[
+            dict(name='a', address=0x20000000, size=8, kind='ram'),
+            dict(name='b', address=0x20000008, size=16, kind='ram')])
+        self.s.symbols = Mock()
+        self.s.symbols.variable.side_effect = lambda name: dict(
+            address=0x20000000 + 4 * int(name[-1]), size=4, type=dict(kind='unsigned', size=4))
+        self.s.image_match = dict(status='matched')
+        # Short first block; later entries must still be reported in order.
+        self.p.memory_read.side_effect = [[], [2], [4], [4], [5]]
+        req = m.ReadBatch(action='read', session_id='s', items=[
+            's0', 's1', 's2', 's4', 's4', dict(kind='memory', address=0x20000014, size=4, width=32)])
+        result = self.s.read(req)
+        self.assertFalse(result['success'])
+        self.assertEqual([item['success'] for item in result['items']], [False, False, True, True, True, True])
+        self.assertEqual([c.args for c in self.p.memory_read.call_args_list], [
+            (0x20000000, 2), (0x20000008, 1), (0x20000010, 1), (0x20000010, 1), (0x20000014, 1)])
+
     def test_resume_reports_immediate_stop(self):
         result = self.s.control(m.RunControl(session_id='s', action='resume'))
         self.assertTrue(result['success'])

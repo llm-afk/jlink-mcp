@@ -1,4 +1,4 @@
-# J-Link MCP 0.6.4
+# J-Link MCP 0.6.5
 
 面向嵌入式调试任务的 MCP 服务。对外提供 **8 个工具**：读取与采集统一到 read，执行控制与断点统一到 control。J-Link DLL、ELF 符号解析和 SVD 是内部实现。0.6 调整了工具名与读取请求，升级后需重载 MCP 客户端；迁移见 [迁移说明](docs/MIGRATION.md)。
 
@@ -111,6 +111,8 @@ read 负责观测和记录，control 负责执行状态与断点生命周期；w
 
 read 的 snapshot/sample 直接复用 variable。运行中的多变量或结构体读取不保证一致时刻。复位、Flash 修改尝试和连接失效会清除映像匹配证据。外部工具或目标自行改写 Flash 时需要重新 verify_image。
 
+调试闭环时，可以在同一个 `items` 中按结构体布局列出要观察的成员。对于要求映像匹配、地址首尾相接、访问宽度相同且位于同一配置 RAM 区的连续变量，服务端一次读取整段，再按原顺序返回每项的值和原始字节。`sample` 在每个采样点重新读取。一次合并读取失败时，该段各项均返回错误，后续段继续读取。寄存器和显式地址读取保留逐项访问。
+
 ## 类型化变量写入（0.6.2）
 
 现有 `write` 新增 `kind="variable"`，复用同一套 DWARF 路径、类型和对象边界检查。以下名称仅为示例，必须替换成当前 ELF 中存在的变量。
@@ -125,14 +127,16 @@ read 的 snapshot/sample 直接复用 variable。运行中的多变量或结构�
 
 请求只提交所选范围一次。`verify=true` 按原范围读回，结果包含地址、类型、ELF SHA256、编码字节和提交值。从 0.6.3 开始，类型化写入完全落在配置的 RAM 内，读回一致且 CPU 仍暂停时，可以继续使用同一会话、ELF 和配置此前取得的只读 Flash 校验证据和时间戳。返回的 `elf_match_after` 表示下一次类型访问能否直接继续。其他已提交的写入会清除匹配证据，完成未知时须先检查目标状态。CPU 暂停期间 DMA 仍可能活动。
 
-## 等待、现场定位和数据观察点（0.5）
+## 等待、现场定位和数据观察点
+
+`wait` 和 `run_until` 的可选字段 `read_on_stop` 接受与 `read.items` 相同的列表。观察到停机后，同一次请求会返回 `stop.read`，其中包含紧凑的逐项结果。用 `completion` 区分命中目标、停在其他位置和超时，再用 `stop.read.success` 判断读取是否成功。超时后按配置暂停也可以取值；目标继续运行时跳过读取。
 
 `control wait` 只等待 CPU 停止，最长 30 秒，不继续、不暂停、不复位。返回停止原因（调试请求、代码断点、数据观察点或向量捕获）、原始原因码和 PC/LR/SP/XPSR；原因读取失败会保留错误，不推断原因。
 
 `control run_until` 要求已经暂停，接收 address 或函数 symbol，设置临时硬件断点并继续运行。返回 target_reached、already_at_target、stopped_elsewhere 或 timeout。默认 on_timeout=halt；显式 running 则不主动暂停。目标已停在指定地址时不执行任何指令。临时断点在正常返回及异常路径清理，复用用户已有断点时保留；清理失败返回剩余 breakpoint_id。DLL 挂死/进程终止时不能保证清理，仍以 BACKEND_TIMEOUT 的未知完成状态为准。
 
 ```json
-{"request":{"session_id":"返回的ID","action":"run_until","symbol":"servo_loop","timeout_ms":3000,"on_timeout":"halt"}}
+{"request":{"session_id":"返回的ID","action":"run_until","symbol":"servo_loop","timeout_ms":3000,"on_timeout":"halt","read_on_stop":["MotorControl.Iq","MotorControl.PID_Iq.kp"]}}
 {"request":{"session_id":"返回的ID","action":"context","instructions":8}}
 ```
 

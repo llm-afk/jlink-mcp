@@ -143,12 +143,16 @@ class ResetControl(Bound):
     mode: Literal["normal", "halt", "core"] = "halt"
 
 
-class WaitControl(Bound):
+class ObserveStop(Bound):
+    read_on_stop: Items | None = Field(default=None, description="Read these items when a stop is observed. See stop.read for the compact halted batch and its own success flag.")
+
+
+class WaitControl(ObserveStop):
     action: Literal["wait"]
     timeout_ms: Annotated[int, Field(ge=1, le=30000)] = 1000
 
 
-class RunUntilControl(Bound):
+class RunUntilControl(ObserveStop):
     action: Literal["run_until"]
     address: Address | None = None
     symbol: Name | None = None

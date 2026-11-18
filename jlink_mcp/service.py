@@ -293,7 +293,7 @@ class DebugService:
         if self.image_match["status"] != "matched":
             raise ServiceError("IMAGE_NOT_MATCHED", "Run firmware verify_image before typed access")
 
-    def _read_one(self, item, plan, compact):
+    def _read_one(self, item, plan, compact, data=None):
         if item.kind == "register":
             self._halted()
             value = self.probe.register_read(plan["name"]) & 0xFFFFFFFF
@@ -301,7 +301,8 @@ class DebugService:
             return {"value": value}
         if item.kind == "variable" and item.require_match:
             self._require_image_match()
-        data = read_bytes(self.probe, plan["address"], plan["bytes"], plan["width"])
+        if data is None:
+            data = read_bytes(self.probe, plan["address"], plan["bytes"], plan["width"])
         result = {"address": plan["address"], "size": len(data), "data_hex": data.hex()}
         if item.kind == "variable":
             result.update(value=decode(plan["type"], data), elf_match=self.image_match["status"])
@@ -315,7 +316,60 @@ class DebugService:
     def read(self, request):
         return self._read(request) if request.action == "read" else self._capture(request)
 
-    def _read(self, request, plans=None):
+    def _read_blocks(self, items, plans):
+        """Group only adjacent matched variables, in caller order and within one RAM region."""
+        blocks = []
+        start = 0
+        for index in range(1, len(plans)):
+            first, previous, current = plans[start], plans[index - 1], plans[index]
+            if (previous.get("kind") == current.get("kind") == "variable"
+                    and items[index - 1].require_match and items[index].require_match
+                    and previous["address"] + previous["bytes"] == current["address"]
+                    and first["width"] == current["width"]
+                    and self._in_memory(first["address"], current["address"] + current["bytes"] - first["address"],
+                                        ram_only=True)):
+                continue
+            blocks.append(range(start, index))
+            start = index
+        blocks.append(range(start, len(plans)))
+        return blocks
+
+    def _read_block(self, request, plans, block):
+        timestamp = utc_now()
+        shared = None
+        if len(block) > 1:
+            first, last = plans[block.start], plans[block.stop - 1]
+            size = last["address"] + last["bytes"] - first["address"]
+            try:
+                if request.consistency == "halted":
+                    self._halted()
+                self._require_image_match()
+                shared = read_bytes(self.probe, first["address"], size, first["width"])
+            except Exception as exc:
+                return [dict(item=request.items[i].model_dump(), timestamp=timestamp, **error_result(exc)) for i in block]
+        results = []
+        for index in block:
+            item, plan = request.items[index], plans[index]
+            entry = {"item": item.model_dump(), "timestamp": timestamp}
+            try:
+                if "error" in plan:
+                    entry.update(plan)
+                elif request.consistency == "live" and item.kind == "register":
+                    raise ServiceError("REQUIRES_HALT", "CPU registers require consistency='halted'")
+                else:
+                    data = None
+                    if shared is not None:
+                        offset = plan["address"] - first["address"]
+                        data = shared[offset:offset + plan["bytes"]]
+                    elif request.consistency == "halted":
+                        self._halted()
+                    entry.update(success=True, data=self._read_one(item, plan, request.compact, data))
+            except Exception as exc:
+                entry.update(error_result(exc))
+            results.append(entry)
+        return results
+
+    def _read(self, request, plans=None, blocks=None):
         if request.consistency == "halted":
             self._halted()
         if plans is None:
@@ -327,21 +381,9 @@ class DebugService:
                     plans.append(error_result(exc))
         if sum(p.get("bytes", 0) for p in plans) > 65536:
             raise ServiceError("LIMIT", "Total batch size must not exceed 64KB")
-        results = []
-        for item, plan in zip(request.items, plans):
-            entry = {"item": item.model_dump(), "timestamp": utc_now()}
-            try:
-                if "error" in plan:
-                    entry.update(plan)
-                elif request.consistency == "live" and item.kind == "register":
-                    raise ServiceError("REQUIRES_HALT", "CPU registers require consistency='halted'")
-                else:
-                    if request.consistency == "halted":
-                        self._halted()
-                    entry.update(success=True, data=self._read_one(item, plan, request.compact))
-            except Exception as exc:
-                entry.update(error_result(exc))
-            results.append(entry)
+        if blocks is None:
+            blocks = self._read_blocks(request.items, plans)
+        results = [entry for block in blocks for entry in self._read_block(request, plans, block)]
         stable = request.consistency != "halted" or self._state() == "halted"
         if not stable:
             for entry in results:
@@ -426,12 +468,20 @@ class DebugService:
     def control(self, request):
         if isinstance(request, (contracts.BreakpointAdd, contracts.BreakpointRemove, contracts.BreakpointList)):
             return self._breakpoint(request)
-        if request.action == "wait":
-            stopped = self._wait_halt(request.timeout_ms)
-            return {"success": stopped, "completion": "observed_halted" if stopped else "timeout",
-                    "stop": self._stop_context() if stopped else None}
-        if request.action == "run_until":
-            return self._run_until(request)
+        if request.action in ("wait", "run_until"):
+            if request.action == "wait":
+                stopped = self._wait_halt(request.timeout_ms)
+                result = {"success": stopped, "completion": "observed_halted" if stopped else "timeout",
+                          "stop": self._stop_context() if stopped else None}
+            else:
+                result = self._run_until(request)
+            if request.read_on_stop and result.get("stop"):
+                try:
+                    result["stop"]["read"] = self._read(contracts.ReadBatch(action="read", session_id=request.session_id,
+                        consistency="halted", compact=True, items=request.read_on_stop))
+                except Exception as exc:
+                    result["stop"]["read"] = error_result(exc)
+            return result
         if request.action == "reset":
             if request.mode == "core":
                 self._cortex_m()
@@ -740,6 +790,7 @@ class DebugService:
             raise ServiceError("LIMIT", "Total batch size must not exceed 64KB")
         if batch_bytes * request.count > 1024 * 1024:
             raise ServiceError("LIMIT", "Sample payload must not exceed 1 MiB")
+        blocks = self._read_blocks(request.items, plans)
         path = Path(request.output_path or f"captures/{uuid.uuid4().hex}.jsonl").resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         total, ok = 0, True
@@ -753,7 +804,7 @@ class DebugService:
                     break
                 # The session lock pins the profile and ELF for this sample sequence.
                 # _read still checks halt/match and fetches fresh target bytes each time.
-                result = self._read(reading, plans)
+                result = self._read(reading, plans, blocks)
                 record = {"index": index, "timestamp": utc_now(), "session_id": self.session_id,
                           "target": self.target, "generation": self.generation,
                           "host_elapsed_ms": (time.perf_counter() - started) * 1000, "result": result}

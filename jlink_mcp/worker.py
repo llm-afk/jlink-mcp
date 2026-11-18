@@ -71,7 +71,10 @@ class DriverWorker:
         if method == "control" and getattr(request, "action", "").startswith("breakpoint_"):
             return 20.0
         if method in ("control", "channel"):
-            return max(10.0, getattr(request, "timeout_ms", 1000) / 1000 + 5.0)
+            timeout = max(10.0, getattr(request, "timeout_ms", 1000) / 1000 + 5.0)
+            if method == "control" and getattr(request, "read_on_stop", None):
+                timeout += 20.0  # Same additional budget as a standalone read.
+            return timeout
         return 20.0
 
     def _exchange(self, method, request, timeout):
