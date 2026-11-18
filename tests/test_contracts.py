@@ -114,9 +114,34 @@ class Contracts(unittest.TestCase):
         self.assertEqual(result['verify_result']['mismatch_count'], 2)
 
     def test_verify_short_read_counts_missing_bytes(self):
-        result = flash._build_verify_result(b'\x01\x02', b'\x01', 0)
+        self.probe.memory_read.return_value = [1]
+        result = flash.verify_flash(0, '01 02')
         self.assertEqual(result['mismatch_count'], 1)
         self.assertIsNone(result['mismatches'][0]['actual'])
+
+    def test_verify_chunks_preserve_addresses_across_short_read_and_limit(self):
+        chunk = 65536
+        base = 0x08000101
+        self.probe.memory_read.side_effect = [bytes(chunk - 2), b'\xff' * 104]
+        result = flash.verify_flash(base, bytes(chunk + 104))
+        self.assertFalse(result['success'])
+        self.assertTrue(result['truncated'])
+        self.assertEqual(result['mismatch_count'], 106)
+        examples = result['mismatches']
+        self.assertEqual(len(examples), 100)
+        self.assertEqual([entry['actual'] for entry in examples[:3]], [None, None, 255])
+        self.assertEqual([entry['address'] for entry in examples], list(range(base + chunk - 2, base + chunk + 98)))
+        self.assertEqual([call.args for call in self.probe.memory_read.call_args_list],
+                         [(base, chunk), (base + chunk, 104)])
+
+    def test_binary_program_verifies_in_chunks_without_resubmitting(self):
+        raw = bytes(range(256)) * 256 + b'\xff'
+        self.probe.memory_read.side_effect = [raw[:-1], b'\x00']
+        result = flash.program_flash(0x8000000, raw)
+        self.probe.flash.assert_called_once_with(raw, 0x8000000)
+        self.assertFalse(result['success'])
+        self.assertEqual(result['verify_result']['mismatches'],
+                         [{'address': 0x8010000, 'expected': 255, 'actual': 0}])
 
     def test_sector_short_read_is_not_erased(self):
         self.probe.memory_read.return_value = []

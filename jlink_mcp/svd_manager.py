@@ -480,7 +480,11 @@ class SVDManager:
         register = self.get_register(device_name, peripheral_name, register_name)
         if not register:
             return None
+        return self.decode_register_value(device_name, peripheral_name, register, value)
 
+    @staticmethod
+    def decode_register_value(device_name: str, peripheral_name: str, register: RegisterInfo,
+                              value: int) -> Dict[str, Any]:
         field_results = []
         for field in register.fields:
             # 使用预计算的 mask，如果为 0 则动态计算（向后兼容）
@@ -516,7 +520,7 @@ class SVDManager:
         return {
             "device_name": device_name,
             "peripheral_name": peripheral_name,
-            "register_name": register_name,
+            "register_name": register.name,
             "register_description": register.description,
             "raw_value": value,
             "hex_value": f"0x{value:X}",

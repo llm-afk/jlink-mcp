@@ -269,12 +269,13 @@ class DebugService:
             return {"kind": "variable", "address": info["address"], "bytes": info["size"],
                     "width": aligned_width(info["address"], info["size"]), "type": info["type"]}
         else:
-            address, info, peripheral, register = self._peripheral(item.name)
+            address, info, peripheral, _ = self._peripheral(item.name)
             if info.access == "write-only":
                 raise ServiceError("WRITE_ONLY", "Cannot read a write-only SVD register")
             if (info.read_action or any(f.read_action for f in info.fields)) and not item.allow_side_effects:
                 raise ServiceError("READ_SIDE_EFFECT", "SVD declares read side effects; opt in explicitly")
-            size, width = info.size // 8, info.size
+            return {"kind": item.kind, "address": address, "bytes": info.size // 8, "width": info.size,
+                    "peripheral": peripheral, "register": info}
         validate_span(address, size, width)
         return {"kind": item.kind, "address": address, "bytes": size, "width": width}
 
@@ -307,9 +308,8 @@ class DebugService:
             if not compact:
                 result["type"] = plan["type"]
         if item.kind == "peripheral":
-            _, _, peripheral, register = self._peripheral(item.name)
-            result["decoded"] = svd_manager.parse_register_value(
-                self.target["svd_device"], peripheral, register, int.from_bytes(data, "little"))
+            result["decoded"] = svd_manager.decode_register_value(
+                self.target["svd_device"], plan["peripheral"], plan["register"], int.from_bytes(data, "little"))
         return result
 
     def read(self, request):
@@ -703,9 +703,15 @@ class DebugService:
             saved = self.snapshots.get(request.snapshot_id)
             if saved is None or saved["generation"] != self.generation:
                 raise ServiceError("STALE_SNAPSHOT", "Snapshot expired after reset, flash, reconnect, or eviction")
-            current = self._read(saved["request"])
+            reading = saved["request"]
+            omit_layouts = request.compact and not reading.compact
+            if omit_layouts:
+                reading = reading.model_copy(update={"compact": True})
+            current = self._read(reading)
             changes = []
             for index, (old, new) in enumerate(zip(saved["result"]["items"], current["items"])):
+                if omit_layouts and "type" in old.get("data", {}):
+                    old = {**old, "data": {k: v for k, v in old["data"].items() if k != "type"}}
                 if not old["success"] or not new["success"]:
                     changes.append({"index": index, "status": "unavailable", "before": old, "after": new})
                 elif old["data"] != new["data"]:
@@ -737,20 +743,20 @@ class DebugService:
         path = Path(request.output_path or f"captures/{uuid.uuid4().hex}.jsonl").resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         total, ok = 0, True
-        started = time.monotonic()
+        started = time.perf_counter()
         with path.open("x", encoding="utf-8") as stream:
             for index in range(request.count):
-                delay = started + index * request.interval_ms / 1000 - time.monotonic()
+                delay = started + index * request.interval_ms / 1000 - time.perf_counter()
                 if delay > 0:
                     time.sleep(delay)
-                if time.monotonic() - started > 10:
+                if time.perf_counter() - started > 10:
                     break
                 # The session lock pins the profile and ELF for this sample sequence.
                 # _read still checks halt/match and fetches fresh target bytes each time.
                 result = self._read(reading, plans)
                 record = {"index": index, "timestamp": utc_now(), "session_id": self.session_id,
                           "target": self.target, "generation": self.generation,
-                          "host_elapsed_ms": (time.monotonic() - started) * 1000, "result": result}
+                          "host_elapsed_ms": (time.perf_counter() - started) * 1000, "result": result}
                 if request.compact and index == 0:
                     record["types"] = {str(i): p["type"] for i, p in enumerate(plans) if "type" in p}
                 stream.write(json.dumps(record, separators=(",", ":")) + "\n")
@@ -793,11 +799,11 @@ class DebugService:
             data = path.read_bytes()
             validate_span(request.address, len(data))
             if request.action == "verify":
-                result = flash.verify_flash(request.address, data.hex())
+                result = flash.verify_flash(request.address, data)
             else:
                 self._remove_owned_breakpoints()
                 self._invalidate()
-                result = flash.program_flash(request.address, data=data.hex(), verify=True)
+                result = flash.program_flash(request.address, data=data, verify=True)
             result["image_sha256"] = hashlib.sha256(data).hexdigest()
             result["verification"] = "readback" if result.get("success") else "failed_or_unknown"
             return result

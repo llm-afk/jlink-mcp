@@ -47,6 +47,7 @@ async def session(request: SessionRequest) -> dict:
 @mcp.tool()
 async def read(request: ReadRequest) -> dict:
     """Read/snapshot/diff/sample up to 64 KiB per sequential batch. CPU registers require halt.
+    In items, a string is a typed variable path, e.g. ["MotorControl.Iq"].
     Typed reads use matched ELF global.member[index] paths. Use compact=true for
     polling, changes-only diffs or sampling with one copy of the types in JSONL.
     Snapshots expire on reset, Flash changes, reconnect or eviction (16 slots).

@@ -1,4 +1,4 @@
-# J-Link MCP 0.6.3
+# J-Link MCP 0.6.4
 
 面向嵌入式调试任务的 MCP 服务。对外提供 **8 个工具**：读取与采集统一到 read，执行控制与断点统一到 control。J-Link DLL、ELF 符号解析和 SVD 是内部实现。0.6 调整了工具名与读取请求，升级后需重载 MCP 客户端；迁移见 [迁移说明](docs/MIGRATION.md)。
 
@@ -165,7 +165,13 @@ read 的 snapshot/sample 直接复用 variable。运行中的多变量或结构�
 
 `read snapshot` 使用与 `read read` 相同的 items/consistency，返回 snapshot_id。`read diff` 将该快照与现在比较。最多保留 16 个，超出淘汰最早项。
 
-轮询变量时可以传 `compact=true`。read/snapshot 保留数值、原始字节、地址和匹配状态，省去逐项的 DWARF 类型描述。sample 的 JSONL 仍为每次观测一行，首行的 `types` 按 item 下标保存一次类型。diff 的精简模式只返回变化和读取失败的项，包含 item 及前后证据。省略 compact 使用原有完整格式。
+read、snapshot 和 sample 可以直接在 `items` 写变量名，也可以与显式的寄存器、内存和外设项混用。字符串使用类型化变量读取，默认要求 ELF 已匹配。例如同时看实际电流和电流环增益：
+
+```json
+{"request":{"session_id":"返回的ID","action":"read","items":["MotorControl.Iq","MotorControl.PID_Iq.kp"],"compact":true}}
+```
+
+轮询变量时可以传 `compact=true`。read/snapshot 保留数值、原始字节、地址和匹配状态，省去逐项的 DWARF 类型描述。sample 的 JSONL 仍为每次观测一行，首行的 `types` 按 item 下标保存一次类型。diff 的精简模式只返回变化和读取失败的项，包含 item 及前后证据。即使基于完整快照，精简比较也省略类型描述。省略 compact 使用原有完整格式。
 
 `read sample` 使用相同 items，外加 `count`、`interval_ms`、可选 `output_path`。最多 128 次、1MiB 原始载荷和 10 秒请求窗口；单次底层驱动阻塞可能延长实际时长。默认文件在当前目录 `captures/`，JSONL 含原始结果、会话及主机时间，不覆盖已有文件。主机时间不是 MCU 精确采样时间，不能用于声称验证了高速电流环时序。
 

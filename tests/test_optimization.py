@@ -382,6 +382,38 @@ class OptimizationTests(unittest.TestCase):
         self.assertFalse(failed['success'])
         self.assertEqual(failed['changes'][0]['status'], 'unavailable')
 
+    def test_variable_shorthand_preserves_validation_and_mixed_item_order(self):
+        for cls, action in ((m.ReadBatch, 'read'), (m.Snapshot, 'snapshot'), (m.Sample, 'sample')):
+            req = cls(session_id='s', action=action, items=['counter', {'kind': 'register', 'name': 'PC'}])
+            self.assertEqual(req.items[0], m.VariableItem(kind='variable', name='counter', require_match=True))
+            self.assertEqual(req.items[1].kind, 'register')
+            self.assertEqual(cls.model_validate_json(req.model_dump_json()), req)
+            for invalid in ('', 'x'*257, 7):
+                with self.assertRaises(ValidationError):
+                    cls(session_id='s', action=action, items=[invalid])
+        service = self.service()
+        blocked = service.read(m.ReadBatch(session_id='s', action='read', items=['counter']))
+        self.assertEqual(blocked['items'][0]['error']['code'], 'IMAGE_NOT_MATCHED')
+        service.probe.memory_read.assert_not_called()
+
+    def test_full_snapshot_supports_both_diff_formats(self):
+        s = self.service()
+        s.image_match = {'status': 'matched'}
+        s.probe.memory_read.side_effect = [[1], [1], [2], OSError('lost read'), [2]]
+        snap = s.read(m.Snapshot(action='snapshot', session_id='test', items=['counter']))
+        req = m.Diff(action='diff', session_id='test', snapshot_id=snap['snapshot_id'], compact=True)
+        self.assertEqual(s.read(req)['changes'], [])
+        changed = s.read(req)['changes'][0]
+        for side in ('before', 'after'):
+            self.assertNotIn('type', changed[side])
+        self.assertEqual((changed['before']['value'], changed['after']['value']), (1, 2))
+        unavailable = s.read(req)['changes'][0]
+        self.assertNotIn('type', unavailable['before']['data'])
+        self.assertIn('error', unavailable['after'])
+        full = s.read(req.model_copy(update={'compact': False}))['changes'][0]
+        self.assertIn('type', full['before'])
+        self.assertIn('type', full['after'])
+
     def test_profile_speed_inherited_and_can_be_overridden(self):
         path = Path(self.temp.name) / 'speed-profile.json'
         path.write_text(profile(speed_khz=20000).model_dump_json())

@@ -13,21 +13,29 @@ from ..utils import logger, human_readable_size, parse_hex_string
 
 # 校验失败时最多返回的不匹配条数（避免大固件校验失败时输出几 MB 的 mismatch 列表）
 _MAX_MISMATCHES = 100
+_READBACK_CHUNK = 64 * 1024
 
 
-def _build_verify_result(data_bytes, read_back_bytes, address):
-    """比较期望数据与实际读回数据，生成校验结果（不匹配项截断到 _MAX_MISMATCHES）."""
-    if read_back_bytes == data_bytes:
-        return {"matched": True, "mismatches": [], "mismatch_count": 0}
-
+def _verify_readback(jlink, address, data):
+    """Compare bounded chunks while retaining absolute mismatch addresses on short reads."""
+    validate_span(address, len(data))
     total = 0
     mismatches = []
-    for i, (a, b) in enumerate(zip_longest(data_bytes, read_back_bytes)):
-        if a != b:
-            total += 1
-            if len(mismatches) < _MAX_MISMATCHES:
-                mismatches.append({"address": address + i, "expected": a, "actual": b})
-
+    for offset in range(0, len(data), _READBACK_CHUNK):
+        expected = data[offset:offset + _READBACK_CHUNK]
+        start = address + offset
+        observed = bytes(jlink.memory_read(start, len(expected)))
+        if expected == observed:
+            continue
+        if len(observed) > len(expected):
+            raise JLinkMCPError(JLinkErrorCode.READ_FAILED, f"读回超过请求范围 {start:#x}")
+        for i, (a, b) in enumerate(zip_longest(expected, observed)):
+            if a != b:
+                total += 1
+                if len(mismatches) < _MAX_MISMATCHES:
+                    mismatches.append({"address": start + i, "expected": a, "actual": b})
+    if not total:
+        return {"matched": True, "mismatches": [], "mismatch_count": 0}
     return {
         "matched": False,
         "mismatches": mismatches,
@@ -197,7 +205,7 @@ def erase_sector(address: int, count: int = 1, page_size: int = 1024) -> Dict[st
         }
 
 
-def program_flash(address: int, data: str | None = None, verify: bool = True, file_path: str | None = None) -> Dict[str, Any]:
+def program_flash(address: int, data: bytes | str | None = None, verify: bool = True, file_path: str | None = None) -> Dict[str, Any]:
     """烧录固件到 Flash.
 
     Args:
@@ -222,7 +230,7 @@ def program_flash(address: int, data: str | None = None, verify: bool = True, fi
             with open(file_path, 'rb') as f:
                 data_bytes = f.read()
         elif data:
-            data_bytes = parse_hex_string(data)
+            data_bytes = data if isinstance(data, bytes) else parse_hex_string(data)
         else:
             raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, "必须提供 data 或 file_path")
 
@@ -237,10 +245,7 @@ def program_flash(address: int, data: str | None = None, verify: bool = True, fi
         if verify:
             # 校验
             logger.info("校验 Flash")
-            read_back = jlink.memory_read(address, len(data_bytes))
-            read_back_bytes = bytes(read_back)  # 统一为 bytes，避免 list/bytes 比较恒为 False
-
-            verify_result = _build_verify_result(data_bytes, read_back_bytes, address)
+            verify_result = _verify_readback(jlink, address, data_bytes)
             if verify_result["matched"]:
                 logger.info("Flash 校验成功")
             else:
@@ -279,7 +284,7 @@ def program_flash(address: int, data: str | None = None, verify: bool = True, fi
         }
 
 
-def verify_flash(address: int, data: str) -> Dict[str, Any]:
+def verify_flash(address: int, data: bytes | str) -> Dict[str, Any]:
     """校验 Flash 内容.
 
     Args:
@@ -297,13 +302,10 @@ def verify_flash(address: int, data: str) -> Dict[str, Any]:
         if not data:
             raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, "数据不能为空")
 
-        data_bytes = parse_hex_string(data)
+        data_bytes = data if isinstance(data, bytes) else parse_hex_string(data)
 
         jlink = jlink_manager.get_jlink()
-        read_back = jlink.memory_read(address, len(data_bytes))
-        read_back_bytes = bytes(read_back)  # 统一为 bytes，避免 list/bytes 比较恒为 False
-
-        verify_result = _build_verify_result(data_bytes, read_back_bytes, address)
+        verify_result = _verify_readback(jlink, address, data_bytes)
 
         if verify_result["matched"]:
             logger.info(f"Flash 校验成功（{len(data_bytes)} 字节）")

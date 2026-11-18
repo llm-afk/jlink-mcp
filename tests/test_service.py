@@ -306,6 +306,7 @@ class ServiceTests(unittest.TestCase):
                 result = self.s.invoke("firmware", m.FirmwareImage(session_id="test", action="program", address=0, file_path=str(path)))
                 self.assertTrue(result["success"])
                 self.assertTrue(program.call_args.kwargs["verify"])
+                self.assertEqual(program.call_args.kwargs["data"], b"1234")
                 self.assertFalse(self.s.snapshots)
 
     def test_elf_is_never_flashed_as_bin(self):
@@ -315,6 +316,27 @@ class ServiceTests(unittest.TestCase):
             result = self.s.invoke("firmware", m.FirmwareImage(session_id="test", action="program", address=0, file_path=str(path)))
             self.assertFalse(result["success"])
             self.probe.flash.assert_not_called()
+
+    def test_svd_sample_reuses_layout_and_decodes_each_target_read(self):
+        info = RegisterInfo(name="STATUS", address_offset=4, size=16, read_action="clear",
+                            fields=[dict(name="READY", bit_offset=0, bit_width=1)])
+        peripheral = PeripheralInfo(name="ADC", base_address=0x40000000)
+        self.probe.memory_read.side_effect = [[0], [1]]
+        with tempfile.TemporaryDirectory() as root, \
+                patch("jlink_mcp.service.svd_manager.get_register", return_value=info) as register, \
+                patch("jlink_mcp.service.svd_manager.get_peripheral", return_value=peripheral) as lookup:
+            path = Path(root) / "regs.jsonl"
+            req = m.Sample(session_id="test", action="sample", count=2, interval_ms=10, output_path=str(path),
+                           items=[dict(kind="peripheral", name="ADC.STATUS", allow_side_effects=True)])
+            self.assertTrue(self.s.invoke("read", req)["complete"])
+            readings = [json.loads(line)["result"]["items"][0]["data"]["decoded"] for line in path.read_text().splitlines()]
+        self.assertEqual([row["fields"][0]["field_value"] for row in readings], [0, 1])
+        lookup.assert_called_once_with("GD32C10x", "ADC")
+        register.assert_called_once_with("GD32C10x", "ADC", "STATUS")
+        self.assertEqual(self.probe.memory_read.call_count, 2)
+        for call in self.probe.memory_read.call_args_list:
+            self.assertEqual(call.args, (0x40000004, 1))
+            self.assertEqual(call.kwargs, {"nbits": 16})
 
     def test_svd_read_side_effect_requires_opt_in(self):
         info = RegisterInfo(name="STATUS", address_offset=0, read_action="clear")

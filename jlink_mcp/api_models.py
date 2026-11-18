@@ -1,7 +1,7 @@
 """Strict, task-oriented MCP contracts. Unsupported options are never ignored."""
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 Address = Annotated[int, Field(ge=0, le=0xFFFFFFFF)]
 Name = Annotated[str, Field(min_length=1, max_length=256)]
@@ -78,7 +78,14 @@ class VariableItem(Request):
 
 
 ReadItem = Annotated[Union[MemoryItem, RegisterItem, PeripheralItem, SymbolItem, VariableItem], Field(discriminator="kind")]
-Items = Annotated[list[ReadItem], Field(min_length=1, max_length=64)]
+
+
+def _expand_variable_name(item):
+    return {"kind": "variable", "name": item} if isinstance(item, str) else item
+
+
+ItemInput = Annotated[ReadItem, BeforeValidator(_expand_variable_name, json_schema_input_type=Union[Name, ReadItem])]
+Items = Annotated[list[ItemInput], Field(min_length=1, max_length=64)]
 
 
 class ReadBatch(Bound):
