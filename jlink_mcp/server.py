@@ -52,6 +52,8 @@ async def read(request: ReadRequest) -> dict:
     polling, changes-only diffs or sampling with one copy of the types in JSONL.
     Snapshots expire on reset, Flash changes, reconnect or eviction (16 slots).
     Sample creates a new file, up to 128 samples, 1 MiB raw and 10 seconds.
+    For faster running-target captures use action=hss with items (scalar RAM
+    paths), rate_hz and duration_ms or count. Returns CSV path, last values and measured timing.
     """
     return await call("read", request)
 

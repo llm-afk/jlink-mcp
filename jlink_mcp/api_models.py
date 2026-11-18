@@ -261,7 +261,40 @@ class Sample(ReadBatch):
         return self
 
 
-ReadRequest = Annotated[Union[ReadBatch, Snapshot, Diff, Sample], Field(discriminator="action")]
+class HssCapture(Bound):
+    action: Literal["hss"]
+    items: Annotated[list[Name], Field(min_length=1, max_length=32,
+        description="Scalar ELF variable paths in desired CSV column order")]
+    rate_hz: Annotated[int, Field(ge=1, le=100000)] = 1000
+    count: Annotated[int, Field(ge=2, le=100000)] | None = None
+    duration_ms: Annotated[int, Field(ge=1, le=10000)] | None = Field(
+        default=None, description="Capture window in ms instead of count. Default is one second, at least two frames.")
+    output_path: str | None = None
+
+    @property
+    def period_us(self):
+        return (1000000 + self.rate_hz - 1) // self.rate_hz
+
+    @property
+    def sample_count(self):
+        if self.count is not None:
+            return self.count
+        window_us = (self.duration_ms or 1000) * 1000
+        frames = (window_us + self.period_us - 1) // self.period_us
+        return frames if self.duration_ms is not None else max(2, frames)
+
+    @model_validator(mode="after")
+    def bounded_capture(self):
+        if self.duration_ms is not None and self.count is not None:
+            raise ValueError("Use either duration_ms or count")
+        if not 2 <= self.sample_count <= 100000 or (self.sample_count - 1) * self.period_us >= 10000000:
+            raise ValueError("Choose a window with 2–100000 frames within 10 seconds")
+        if len(set(self.items)) != len(self.items):
+            raise ValueError("HSS column names must be unique")
+        return self
+
+
+ReadRequest = Annotated[Union[ReadBatch, Snapshot, Diff, Sample, HssCapture], Field(discriminator="action")]
 
 
 class FirmwareImage(Bound):

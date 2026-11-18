@@ -1,9 +1,11 @@
 """Bounded text and binary RTT transfers."""
 import base64
 import codecs
+import ctypes
 import hashlib
 import time
 from pathlib import Path
+import pylink
 from ..jlink_manager import jlink_manager
 from ..exceptions import JLinkMCPError, JLinkErrorCode
 from ..utils import logger
@@ -193,10 +195,16 @@ def rtt_write(data=None, buffer_index=None, timeout_ms=None, *, data_b64=None, d
             raise JLinkMCPError(JLinkErrorCode.OPERATION_TIMEOUT, 'RTT 提交前已超时')
         delay = 0.001
         chunk_size = 4096 if timeout else len(payload)
+        # Keep the immutable payload alive while passing suffixes by pointer.
+        wire = ctypes.c_char_p(payload) if len(payload) >= 1024 and isinstance(jlink, pylink.JLink) else None
+        address = ctypes.cast(wire, ctypes.c_void_p).value if wire is not None else None
         while written < len(payload):
-            chunk = payload[written:written + chunk_size]
-            count = jlink.rtt_write(index, chunk)
-            if not 0 <= count <= len(chunk):
+            size = min(chunk_size, len(payload) - written)
+            if address is None:
+                count = jlink.rtt_write(index, payload[written:written + size])
+            else:
+                count = jlink._dll.JLINK_RTTERMINAL_Write(index, ctypes.c_void_p(address + written), size)
+            if not 0 <= count <= size:
                 raise JLinkMCPError(JLinkErrorCode.WRITE_FAILED, 'RTT 返回无效写入长度')
             written += count
             if written == len(payload):
@@ -205,7 +213,7 @@ def rtt_write(data=None, buffer_index=None, timeout_ms=None, *, data_b64=None, d
             if remaining <= 0:
                 break
             if count:
-                delay = 0.001
+                delay = 0.00025 if address is not None else 0.001
             else:
                 delay = _backoff(delay, remaining)
                 if time.perf_counter() >= deadline:

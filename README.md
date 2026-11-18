@@ -1,4 +1,4 @@
-# J-Link MCP 0.6.6
+# J-Link MCP 0.7.0
 
 面向嵌入式调试任务的 MCP 服务。对外提供 **8 个工具**：读取与采集统一到 read，执行控制与断点统一到 control。J-Link DLL、ELF 符号解析和 SVD 是内部实现。0.6 调整了工具名与读取请求，升级后需重载 MCP 客户端；迁移见 [迁移说明](docs/MIGRATION.md)。
 
@@ -26,7 +26,7 @@ SDK 固定兼容范围 `mcp>=1.26.0,<2`；MCP 2.x 更改了 FastMCP API。ELF �
 |---|---|
 | discover | 枚举探针、可用 SVD、能力边界，不连接目标 |
 | session | open / status / close |
-| read | read / snapshot / diff / sample；支持 memory / register / peripheral / symbol / variable |
+| read | read / snapshot / diff / sample；hss 用探针高速采集运行中的 RAM 标量 |
 | write | 单次 memory / register / peripheral / variable 写入，可显式校验 |
 | control | halt / resume / reset / step / wait / run_until / breakpoint_set / breakpoint_remove / breakpoint_list |
 | inspect | symbol / variable / preflight / svd / context / fault |
@@ -216,7 +216,19 @@ read、snapshot 和 sample 可以直接在 `items` 写变量名，也可以与�
 
 RTT 通道提供字节流。读取或采集会消费所选通道的数据，应用协议负责帧边界。连续文本读取之间如果消费了二进制数据，该通道的 UTF-8 解码状态会重新开始。
 
-日常观察几个变量，用 `read sample` 按主机时钟采样，最短请求间隔为 10 ms。要对齐 ADC 中断或电流环周期，可让固件在对应位置将选定信号、序号或时间戳写入同一 RTT 帧，再用 `channel capture` 收集。HSS 适用于保持原固件并更高频地异步观察内存的场景；当前 MCP 的 `read sample` 使用主机轮询。参见 [SEGGER J-Scope 采样模式](https://kb.segger.com/J-Scope)。
+日常低速观察用 `read sample`，最短主机请求间隔 10 ms。保持生产固件并高速观察 RAM 趋势用 `read hss`。要对齐 ADC 中断或电流环周期，可让固件在对应位置将选定信号、序号或时间戳写入同一 RTT 帧，再用 `channel capture` 收集。[SEGGER 采样模式](https://kb.segger.com/J-Scope)
+
+### HSS 采集
+
+载入带 RAM 区域的 profile 和对应 ELF，执行 `firmware verify_image`，保持 CPU 运行并关闭本会话的 RTT 通道。将下列请求交给 `read`，即可用 5 kHz 目标频率观察半秒钟的 d/q 轴反馈电流。
+
+```json
+{"request":{"action":"hss","session_id":"返回的ID","items":["MotorControl.Id","MotorControl.Iq"],"rate_hz":5000,"duration_ms":500}}
+```
+
+`items` 可填 1–32 个标量变量路径，包括结构体成员、具名 union 成员、数组元素。服务端按实际 RAM 地址合并相邻或重叠字节，CSV 列按请求顺序排列。文件第一列为探针时间戳（微秒），随后是各变量数值；枚举和指针按数值记录。指定 `output_path` 可保存到新的 CSV，默认路径随结果返回。`last_values` 可直接查看末帧。
+
+用 `duration_ms` 按探针时间戳截取窗口，实际帧数随采样速度变化；用 `count` 则采到指定帧数或超时。默认约 1 秒。请求上限为 10 秒、100000 帧、8 MiB 原始数据。探针能力、SWD 速率和分散块数共同影响实际频率。用 `actual_hz`、`max_interval_us` 和 `intervals_over_2x_period` 检查采样质量；`complete` 表示对应的时长或帧数条件已满足。采集和计时由 HSS 完成，主机分批取回，停止采集后生成 CSV。多个地址块依次观察，电流环相位仍由固件决定。
 
 ## 架构和当前范围
 

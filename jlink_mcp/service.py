@@ -19,6 +19,7 @@ from .jlink_manager import jlink_manager
 from .symbols import SymbolFile
 from .profiles import load_profile
 from .image_match import compare_image
+from . import hss
 from .source_context import disassemble
 from .fault_context import recover_frame, decode_fault_flags
 from .dwarf_variables import decode, encode
@@ -146,7 +147,7 @@ class DebugService:
                 "elf": "32-bit little-endian ET_EXEC; static DWARF globals/members/fixed arrays",
                 "typed_write": "halted, matched ELF, profiled RAM; scalar or fixed 1D scalar array; named union paths",
                 "execution_debug": self.target is not None and self.target["architecture"] == "cortex-m",
-                "read_actions": ["read", "snapshot", "diff", "sample"], "channel": "RTT",
+                "read_actions": ["read", "snapshot", "diff", "sample", "hss"], "channel": "RTT",
                 "control": ["halt", "resume", "reset", "step", "wait", "run_until",
                             "breakpoint_set", "breakpoint_remove", "breakpoint_list"],
                 "breakpoint_kinds": ["execute", "read", "write", "access"],
@@ -328,6 +329,24 @@ class DebugService:
         return result
 
     def read(self, request):
+        if request.action == "hss":
+            if self._state() != "running":
+                raise ServiceError("REQUIRES_RUNNING", "HSS requires a running target")
+            if rtt.rtt_get_status()["started"]:
+                raise ServiceError("BACKEND_BUSY", "Close the active RTT channel before HSS")
+            fields = [self._typed_variable(name) for name in request.items]
+            for field in fields:
+                if not self._in_memory(field["address"], field["size"], ram_only=True):
+                    raise ServiceError("RAM_REQUIRED", "HSS requires profiled RAM variables")
+            try:
+                result = hss.capture(self.probe, request, fields, self.profile.regions)
+            except hss.StopError:
+                self.session(contracts.CloseSession(action="close", session_id=request.session_id))
+                raise
+            result["elf_sha256"] = self.symbols.sha256
+            if self._state() != "running":
+                result.update(success=False, error={"code": "STATE_CHANGED", "message": "Target no longer running"})
+            return result
         return self._read(request) if request.action == "read" else self._capture(request)
 
     def _read_blocks(self, items, plans):

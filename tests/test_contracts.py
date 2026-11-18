@@ -1,4 +1,5 @@
 import base64
+import ctypes
 import hashlib
 import io
 import tempfile
@@ -216,6 +217,20 @@ class Contracts(unittest.TestCase):
         result = rtt.rtt_write('ABCDE')
         self.assertFalse(result['success'])
         self.assertEqual(result['bytes_written'], 2)
+
+    def test_bulk_native_rtt_preserves_binary_suffixes(self):
+        self.probe.__class__ = rtt.pylink.JLink
+        self.start_rtt()
+        received = bytearray()
+        def submit(index, pointer, size):
+            accepted = min(size, 255)
+            received.extend(ctypes.string_at(pointer, accepted))
+            return accepted
+        self.probe._dll.JLINK_RTTERMINAL_Write.side_effect = submit
+        data = bytes(range(256)) * 32
+        result = rtt.rtt_write(data_b64=base64.b64encode(data).decode())
+        self.assertEqual(result['bytes_written'], len(data))
+        self.assertEqual(received, data)
 
     def test_exchange_reads_only_requested_reply_and_preserves_next_frame(self):
         self.start_rtt()
