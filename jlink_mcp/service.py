@@ -161,7 +161,15 @@ class DebugService:
 
     def session(self, request):
         if request.action == "status":
-            return {"success": True, "server_version": __version__, "connection": connection.get_connection_status(),
+            status = connection.get_connection_status()
+            if request.compact:
+                data = status.get("data") or {}
+                result = {"success": status["success"], "server_version": __version__,
+                          "target_connected": data.get("target_connected"), "image_match": self._image_summary()}
+                if "error" in status:
+                    result["error"] = status["error"]
+                return result
+            return {"success": True, "server_version": __version__, "connection": status,
                     "elf": self._elf_identity(), "image_match": copy.deepcopy(self.image_match),
                     "profile": {"identity": self.profile_identity, "config": self.profile.model_dump()} if self.profile else None,
                     "capabilities": self.capabilities(), "channel": rtt.rtt_get_status()}
@@ -195,7 +203,10 @@ class DebugService:
         resolved["interface"] = resolved["interface"] or "SWD"
         resolved["architecture"] = resolved["architecture"] or "unknown"
         resolved["speed_khz"] = resolved["speed_khz"] if resolved["speed_khz"] is not None else "auto"
-        request = contracts.OpenSession(action="open", **resolved)
+        request = contracts.OpenSession(action="open", verify_image=request.verify_image, **resolved)
+        if request.verify_image and (not profile or not request.elf_path or
+                                    not any(r.kind == "flash" and not r.mutable for r in profile.regions)):
+            raise ServiceError("PROFILE_REQUIRED", "Verified open requires an ELF and a profile with immutable Flash")
         symbols = SymbolFile(request.elf_path) if request.elf_path else None
         if symbols and request.architecture == "cortex-m" and symbols.machine != "EM_ARM":
             raise ServiceError("ARCH_MISMATCH", "Cortex-M requires an ARM ELF")
@@ -219,6 +230,14 @@ class DebugService:
         self.symbols = symbols
         self.profile, self.profile_identity = profile, profile_identity
         self._invalidate()
+        if request.verify_image:
+            self._verify_speed()
+            self._verify_image()
+            result = {"success": self.image_match["status"] == "matched", "session_id": self.session_id,
+                      "elf": self._elf_identity(), "image_match": self._image_summary(), "profile": profile_identity}
+            if not result["success"]:
+                result["error"] = error_result(self._image_error())["error"]
+            return result
         return {"success": True, "session_id": self.session_id, "capabilities": self.capabilities(),
                 "elf": self._elf_identity(), "profile": profile_identity,
                 "connection": actual}
@@ -307,7 +326,23 @@ class DebugService:
 
     def _require_image_match(self):
         if self.image_match["status"] != "matched":
-            raise ServiceError("IMAGE_NOT_MATCHED", "Run firmware verify_image before typed access")
+            raise self._image_error()
+
+    def _image_summary(self):
+        fields = ("status", "compared_bytes", "eligible_bytes", "mismatched_bytes", "elf_sha256", "reason")
+        return {key: self.image_match[key] for key in fields if key in self.image_match}
+
+    def _image_error(self):
+        status = self.image_match["status"]
+        if status == "mismatch":
+            message = "ELF differs from target Flash. Select the matching ELF and reopen the session."
+        elif status == "partial":
+            message = "Incomplete Flash coverage. Inspect session status image_match.skipped and check the project profile."
+        elif self.image_match.get("errors") or "compared_bytes" in self.image_match:
+            message = "Image comparison was inconclusive. Inspect session status image_match.errors and skipped ranges."
+        else:
+            message = "Run firmware verify_image before using matched ELF locations"
+        return ServiceError("IMAGE_NOT_MATCHED", message)
 
     def _read_one(self, item, plan, compact, data=None):
         if item.kind == "register":
@@ -591,8 +626,7 @@ class DebugService:
             info = self._symbol(symbol)
             if info["kind"] != "STT_FUNC":
                 raise ServiceError("UNSUPPORTED_SYMBOL", "Execution breakpoint requires a function symbol")
-            if self.image_match["status"] != "matched":
-                raise ServiceError("IMAGE_NOT_MATCHED", "Symbol breakpoints require firmware verify_image; use an explicit address for investigation")
+            self._require_image_match()
             address = info["address"]
         return address & ~1
 
@@ -750,6 +784,11 @@ class DebugService:
                     "note": "Observations only; no debug bits, CPU state or Flash changed. Not a general safety verdict."}
         if request.action == "symbol":
             return {"success": True, "symbol": self._symbol(request.name), "elf": self._elf_identity()}
+        if request.action == "find_symbol":
+            if not self.symbols:
+                raise ServiceError("ELF_REQUIRED", "Open a session with elf_path")
+            return {"success": True, **self.symbols.find(request.query, request.kind, request.limit),
+                    "elf": self._elf_identity()}
         if request.action == "svd":
             device = self.target.get("svd_device")
             if not device:
@@ -858,16 +897,22 @@ class DebugService:
         return {"success": ok and total == request.count, "sample_count": total,
                 "complete": total == request.count, "path": str(path), "clock": "host observation, not MCU sample time"}
 
-    def firmware(self, request):
-        if request.action == "verify_image":
-            if not self.symbols or not self.profile:
-                raise ServiceError("PROFILE_REQUIRED", "ELF image comparison requires an ELF and profiled Flash regions")
-            self.image_match = {"status": "unknown", "reason": "comparison in progress"}
+    def _verify_image(self):
+        if not self.symbols or not self.profile:
+            raise ServiceError("PROFILE_REQUIRED", "ELF image comparison requires an ELF and profiled Flash regions")
+        self.image_match = {"status": "unknown", "reason": "comparison in progress"}
+        try:
             result = compare_image(self.symbols, self.profile, lambda address, size: read_bytes(
                 self.probe, address, size, aligned_width(address, size)))
-            result.update(timestamp=utc_now(), generation=self.generation, profile=self.profile_identity)
-            self.image_match = copy.deepcopy(result)
-            return result
+        except Exception as exc:
+            result = {**error_result(exc), "status": "unknown", "reason": str(exc), "errors": [str(exc)]}
+        result.update(timestamp=utc_now(), generation=self.generation, profile=self.profile_identity)
+        self.image_match = copy.deepcopy(result)
+        return result
+
+    def firmware(self, request):
+        if request.action == "verify_image":
+            return self._verify_image()
         # Flash algorithms may change execution state. Require an explicit halt
         # first; report the final state instead of promising implicit recovery.
         self._halted()

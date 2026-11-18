@@ -50,6 +50,22 @@ class SymbolFile:
         return {"path": self.path, "sha256": self.sha256, "machine": self.machine,
                 "target_match": "unknown", "types": "bounded static DWARF globals and ELF symbols"}
 
+    def find(self, query, kind, limit):
+        needle = query.casefold()
+        wanted = {"object": "STT_OBJECT", "function": "STT_FUNC"}.get(kind)
+        matches = []
+        for name, entries in self.symbols.items():
+            if needle not in name.casefold():
+                continue
+            for entry in entries:
+                if wanted is None or entry["kind"] == wanted:
+                    matches.append({**entry, "ambiguous": len(entries) > 1})
+        def rank(entry):
+            name = entry["name"].casefold()
+            return (name != needle, not name.startswith(needle), len(name), name, entry["name"], entry["address"])
+        matches.sort(key=rank)
+        return {"matches": matches[:limit], "total": len(matches)}
+
     def variable(self, expression):
         if self._variables is None:
             self._variables = DwarfVariables(self.elf)

@@ -27,6 +27,7 @@ class OpenSession(Request):
     architecture: Literal["cortex-m", "unknown"] | None = None
     svd_device: Name | None = None
     elf_path: str | None = None
+    verify_image: bool = Field(default=False, description="Compare immutable Flash to the profile ELF during open. Use for typed variables or HSS; check image_match.status.")
     jlink_path: str | None = None
     speed_khz: Speed | None = Field(default=None, description="Interface speed in kHz or auto; inherits profile when omitted. Fixed speed requires identical probe readback.")
 
@@ -39,6 +40,7 @@ class OpenSession(Request):
 
 class SessionStatus(Request):
     action: Literal["status"]
+    compact: bool = Field(default=False, description="Return live connection and cached image evidence without profile, capability or RTT details.")
 
 
 class CloseSession(Bound):
@@ -226,6 +228,13 @@ class InspectSymbol(Bound):
     name: Name
 
 
+class FindSymbol(Bound):
+    action: Literal["find_symbol"]
+    query: Name = Field(description="Case-insensitive literal substring of an ELF symbol name.")
+    kind: Literal["object", "function"] | None = None
+    limit: Annotated[int, Field(ge=1, le=32)] = 8
+
+
 class InspectVariable(Bound):
     action: Literal["variable"]
     name: Name
@@ -235,7 +244,7 @@ class InspectPreflight(Bound):
     action: Literal["preflight"]
 
 
-InspectRequest = Annotated[Union[InspectFault, InspectContext, InspectSvd, InspectSymbol, InspectVariable, InspectPreflight], Field(discriminator="action")]
+InspectRequest = Annotated[Union[InspectFault, InspectContext, InspectSvd, InspectSymbol, FindSymbol, InspectVariable, InspectPreflight], Field(discriminator="action")]
 
 
 class Snapshot(ReadBatch):

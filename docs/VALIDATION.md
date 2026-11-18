@@ -1,5 +1,18 @@
 # 验证记录
 
+## 2026-11-18　0.7.1 AI 客户端只读调试
+
+通过独立 MCP stdio 客户端连接 GD32C103CB，探针读回 10,000 kHz。对正式 APP 145 依次测试两种调用流程，都比较了 38,436 字节并成功批量读取 `SystickCount` 和 `MotorControl.Iq`。
+
+| 场景 | MCP 调用次数 | MCP 文本结果大小 |
+|---|---:|---:|
+| 普通 open → verify_image → read | 3 | 5,593 B |
+| open 带 verify_image → read | 2 | 2,793 B |
+| 完整 session status | 1 | 5,095 B |
+| 精简 session status | 1 | 807 B |
+
+大小按客户端收到的 `content[0].text` 的 UTF-8 字节数计算。两条流程使用同一服务版本与同一正式 ELF。查询 `systick` 找到 `SystickCount`。另用 RTT 测试固件的 ELF 连接同一块板，比较 26,780 字节、25,731 字节不同，返回 `mismatch` 及会话 ID。随后两项变量读取均返回 `IMAGE_NOT_MATCHED`，关闭会话成功。三个会话读取完成时 CPU 均为 running，测试只执行连接、校验、搜索、读取和关闭。
+
 ## 2026-11-18　0.7.0 HSS 与 RTT 实板对照
 
 GD32C103CB，J-Link SN 174504233。HSS 使用已匹配的正式 APP 145，MCU 持续运行。两种 RTT 测速固件都基于该源码的隔离副本，只调整缓冲区大小。对照基线为 0.6.6 `0079140`，每次连接都核对 SWD 读回值和 ELF。下面的上行、下行均以 KiB/s 表示。

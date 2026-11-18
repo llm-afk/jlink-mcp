@@ -38,8 +38,9 @@ async def discover() -> dict:
 @mcp.tool()
 async def session(request: SessionRequest) -> dict:
     """Open with a chip and probe serial, optionally supplied by a project profile.
-    Use session_id for target calls. Status reports server_version, connection,
-    speed and ELF match. Run firmware verify_image before typed access.
+    With a known profile and probe, open directly with verify_image=true for typed reads or HSS.
+    Continue on image_match.status=matched. If comparison fails, keep session_id for status or close.
+    Use status with compact=true to recover meta.session_id, CPU state and image match.
     """
     return await call("session", request)
 
@@ -89,7 +90,8 @@ async def control(request: ControlRequest) -> dict:
 async def inspect(request: InspectRequest) -> dict:
     """Inspect symbols/types/SVD/preflight, halted context or Cortex-M fault evidence.
 
-    variable resolves explicit global/member/index paths, including named union
+    find_symbol searches the loaded ELF by substring when you only know part of a variable
+    or function name. variable resolves explicit global/member/index paths, including named union
     members, without reading the target. context maps PC/LR to ELF source ranges
     and disassembles bounded target bytes.
     fault recovers a bounded exception frame at handler entry or caller-supplied
@@ -125,11 +127,14 @@ async def channel(request: ChannelRequest) -> dict:
 @mcp.resource("debug://guide")
 def guide() -> str:
     """Usage guidance is a resource, not an extra hardware tool."""
-    return ("discover -> session open -> read action=read/live; read also owns snapshot/diff/sample. "
-            "control owns breakpoint_set/remove/list and must halt explicitly for CPU registers, "
-            "stepping or Flash modification. Profile sessions may verify_image live before typed reads. Every target request carries session_id. Inspect capability "
-            "limits in session status. Never infer completion from driver submission. "
-            "ELF identity is not proof of the flashed image. See README and docs/MIGRATION.md.")
+    return ("Tool arguments are nested under request except for discover. Discover if the probe serial is unknown. "
+            "For a known project, session(action=open, profile_path=..., serial_number=..., verify_image=true). "
+            "When image_match.status=matched, use its session_id with read(action=read, items=[...], compact=true). "
+            "For an unknown name use inspect(action=find_symbol, query=...). For a struct layout use inspect(action=variable). "
+            "Use read(action=hss) for running RAM scalars, channel(action=capture) for a firmware RTT stream, "
+            "and control(action=wait, read_on_stop=[...]) for values at a stop. "
+            "After losing context use session(action=status, compact=true) and check meta.target and meta.session_id. "
+            "Inspect full session status for image comparison details. Never replay an uncertain write.")
 
 
 def main():

@@ -24,6 +24,20 @@ def elf_fixture(duplicate=False):
 
 
 class SymbolTests(unittest.TestCase):
+    def test_search_is_bounded_typed_and_reports_ambiguity(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "fixture.elf"
+            path.write_bytes(elf_fixture(duplicate=True))
+            symbols = SymbolFile(str(path))
+            found = symbols.find("C", None, 1)
+            self.assertEqual(found["total"], 3)
+            self.assertEqual([hit["name"] for hit in found["matches"]], ["counter"])
+            self.assertTrue(found["matches"][0]["ambiguous"])
+            fn = symbols.find("POINT", "function", 8)["matches"][0]
+            self.assertFalse(fn["ambiguous"])
+            self.assertEqual(fn["name"], "checkpoint")
+            self.assertEqual(symbols.find("point", "object", 8), {"matches": [], "total": 0})
+
     def test_object_and_function_identity(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "fixture.elf"

@@ -1,4 +1,4 @@
-# J-Link MCP 0.7.0
+# J-Link MCP 0.7.1
 
 面向嵌入式调试任务的 MCP 服务。对外提供 **8 个工具**：读取与采集统一到 read，执行控制与断点统一到 control。J-Link DLL、ELF 符号解析和 SVD 是内部实现。0.6 调整了工具名与读取请求，升级后需重载 MCP 客户端；迁移见 [迁移说明](docs/MIGRATION.md)。
 
@@ -29,11 +29,29 @@ SDK 固定兼容范围 `mcp>=1.26.0,<2`；MCP 2.x 更改了 FastMCP API。ELF �
 | read | read / snapshot / diff / sample；hss 用探针高速采集运行中的 RAM 标量 |
 | write | 单次 memory / register / peripheral / variable 写入，可显式校验 |
 | control | halt / resume / reset / step / wait / run_until / breakpoint_set / breakpoint_remove / breakpoint_list |
-| inspect | symbol / variable / preflight / svd / context / fault |
+| inspect | find_symbol / symbol / variable / preflight / svd / context / fault |
 | firmware | verify_image / program / verify / backup / erase_pages / erase_chip |
 | channel | RTT open / status / read / write / exchange / capture / close |
 
 使用提示是 `debug://guide` 资源，不占工具列表。
+
+### AI 客户端首次读取变量
+
+已知探针序列号和项目配置时，可直接依次调用 `session` 和 `read`。以下示例使用项目配置中的 ELF，也可在 `open` 时指定本次构建的 `elf_path`。
+
+```json
+{"request":{"action":"open","profile_path":"C:/Users/32196/Desktop/jlink-mcp/profiles/c1_driver.json","serial_number":"174504233","verify_image":true}}
+```
+
+当 `success=true` 且 `image_match.status="matched"` 时，带上返回的 ID 批量读取。
+
+```json
+{"request":{"action":"read","session_id":"返回的ID","items":["SystickCount","MotorControl.Iq"],"compact":true}}
+```
+
+比较失败时 `success=false`，已建立的会话仍返回 `session_id`。用完整 `session status` 查看差异、跳过范围或读取错误。遇到 `mismatch` 应核对固件对应的 ELF。恢复对话上下文时，`session(action=status, compact=true)` 返回当前连接状态、缓存的校验摘要和 `meta` 中的探针、CPU 状态及会话 ID。
+
+只知道部分名称时，用 `inspect(action=find_symbol, query="systick", kind="object")` 搜索当前 ELF。结果按精确命中、前缀、子串排序，默认最多 8 项，可用 `total` 判断是否需要缩小查询范围。同名符号标记为 `ambiguous`。结构体成员布局可用 `inspect(action=variable)` 查询。
 
 read 负责观测和记录，control 负责执行状态与断点生命周期；write、firmware 和 RTT channel 各自保留独立入口。read 必须明确 action，断点动作使用 breakpoint_ 前缀；每种 action 仍有独立的严格字段模型。
 

@@ -66,6 +66,8 @@ class DriverWorker:
 
     @staticmethod
     def deadline(method, request):
+        if method == "session" and getattr(request, "verify_image", False):
+            return 140.0  # Open plus the independent Flash comparison budget.
         if method == "firmware":
             return 120.0
         if method == "control" and getattr(request, "action", "").startswith("breakpoint_"):

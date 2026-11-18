@@ -321,6 +321,44 @@ class OptimizationTests(unittest.TestCase):
             self.assertEqual(s.symbols.path, str(self.path))
             conn.connect_device.assert_called_once_with('123', 'SWD', 'GD32C103CB', None, speed_khz='auto')
 
+    def test_verified_open_and_status_share_comparison(self):
+        path = Path(self.temp.name) / 'profile.json'
+        path.write_text(profile(elf_path='test.elf').model_dump_json())
+        req = m.OpenSession(action='open', profile_path=str(path), serial_number='123', verify_image=True)
+        for status, raw in [('matched', b'CODE'), ('mismatch', b'FAIL'), ('unknown', b'')]:
+            with self.subTest(status=status), patch('jlink_mcp.service.jlink_manager') as manager, patch('jlink_mcp.service.gdb_server_manager') as gdb, patch('jlink_mcp.service.connection') as conn:
+                manager.is_connected = gdb.is_running = False
+                conn.get_connection_status.return_value = {'success': True, 'data': {'target_connected': True, 'device_serial': 123}}
+                conn.connect_device.return_value = {'success': True}
+                probe = manager.get_jlink.return_value
+                probe.memory_read.return_value = [int.from_bytes(raw, 'little')] if raw else []
+                s = DebugService()
+                opened = s.invoke('session', req)
+                self.assertEqual(opened['success'], status == 'matched')
+                self.assertEqual(opened['image_match']['status'], status)
+                self.assertEqual(opened['session_id'], s.session_id)
+                compact = s.invoke('session', m.SessionStatus(action='status', compact=True))
+                self.assertTrue(compact['target_connected'])
+                self.assertEqual(compact['image_match'], opened['image_match'])
+                self.assertNotIn('ranges', compact['image_match'])
+                self.assertEqual(compact['meta']['session_id'], opened['session_id'])
+                self.assertIn('ranges', s.invoke('session', m.SessionStatus(action='status'))['image_match'])
+                probe.memory_read.assert_called_once()
+                probe.halt.assert_not_called()
+                probe.memory_write.assert_not_called()
+                if status != 'matched':
+                    blocked = s.invoke('read', m.ReadBatch(action='read', session_id=s.session_id, items=['counter']))
+                    self.assertEqual(blocked['items'][0]['error'], opened['error'])
+                    probe.memory_read.assert_called_once()
+
+    def test_verified_open_requires_profile_and_elf_before_connect(self):
+        with patch('jlink_mcp.service.jlink_manager') as manager, patch('jlink_mcp.service.gdb_server_manager') as gdb, patch('jlink_mcp.service.connection.connect_device') as connect:
+            manager.is_connected = gdb.is_running = False
+            req = m.OpenSession(action='open', chip='test', serial_number='123', verify_image=True)
+            result = DebugService().invoke('session', req)
+            self.assertEqual(result['error']['code'], 'PROFILE_REQUIRED')
+            connect.assert_not_called()
+
     def test_reset_and_write_invalidate_match(self):
         s = self.service()
         s.image_match = {'status': 'matched'}
