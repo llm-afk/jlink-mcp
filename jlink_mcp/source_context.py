@@ -50,13 +50,16 @@ class SourceIndex:
                 if program is None:
                     continue
                 previous = None
+                paths = {}
                 for entry in program.get_entries():
                     state = entry.state
                     if state is None:
                         continue
                     if previous is not None and previous.address < state.address and previous.line:
+                        if previous.file not in paths:
+                            paths[previous.file] = source_path(cu, program, previous.file)
                         self.ranges.append((previous.address, state.address,
-                                            {'file': source_path(cu, program, previous.file),
+                                            {'file': paths[previous.file],
                                              'line': previous.line, 'column': previous.column}))
                     previous = None if state.end_sequence else state
             except Exception as exc:

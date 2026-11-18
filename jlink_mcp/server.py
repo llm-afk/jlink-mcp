@@ -113,6 +113,8 @@ async def channel(request: ChannelRequest) -> dict:
     """RTT text and binary I/O. Read as text_hex (default), text or base64.
     Write text or data_b64. bytes_written counts accepted bytes. Capture drains
     up to size raw bytes to a new file within timeout_ms and preserves partial data.
+    Exchange writes a command and consumes the next reply_size bytes on the same
+    channel index under one deadline. Replies, including partial replies, use data_b64.
     Status reports buffer and host overflow counters from the driver when available.
     """
     return await call("channel", request)

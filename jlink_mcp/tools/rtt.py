@@ -89,15 +89,18 @@ def _backoff(delay, remaining):
     return min(0.010, delay * 2)
 
 
-def _read_until(jlink, index, size, deadline):
+def _read_until(jlink, index, size, deadline, *, fast_until=None):
     delay = 0.001
     while True:
         data = bytes(jlink.rtt_read(index, size))
         if data:
             return data
-        remaining = deadline - time.perf_counter()
+        now = time.perf_counter()
+        remaining = deadline - now
         if remaining <= 0:
             return b''
+        if fast_until is not None and now < fast_until:
+            delay = 0.001
         delay = _backoff(delay, remaining)
         if time.perf_counter() >= deadline:
             return b''
@@ -167,7 +170,7 @@ def rtt_capture(buffer_index, size, timeout_ms, output_path):
                         complete=False, bytes_read=consumed, bytes_written=saved, path=path)
 
 
-def rtt_write(data=None, buffer_index=None, timeout_ms=None, *, data_b64=None):
+def rtt_write(data=None, buffer_index=None, timeout_ms=None, *, data_b64=None, deadline=None):
     """Immediately submit the next suffix on progress, back off on a full buffer."""
     written = 0
     try:
@@ -184,7 +187,10 @@ def rtt_write(data=None, buffer_index=None, timeout_ms=None, *, data_b64=None):
         if not 1 <= len(payload) <= 65536:
             raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, '写入载荷必须为 1–65536 字节')
         jlink = _session()
-        deadline = time.perf_counter() + timeout / 1000
+        if deadline is None:
+            deadline = time.perf_counter() + timeout / 1000
+        elif time.perf_counter() >= deadline:
+            raise JLinkMCPError(JLinkErrorCode.OPERATION_TIMEOUT, 'RTT 提交前已超时')
         delay = 0.001
         chunk_size = 4096 if timeout else len(payload)
         while written < len(payload):
@@ -207,6 +213,38 @@ def rtt_write(data=None, buffer_index=None, timeout_ms=None, *, data_b64=None):
         raise JLinkMCPError(JLinkErrorCode.OPERATION_TIMEOUT, f'仅发送 {written}/{len(payload)} 字节，请检查目标运行状态和下行缓冲区')
     except Exception as exc:
         return _failure(exc, code=JLinkErrorCode.WRITE_FAILED, bytes_written=written, complete=False, retry_safe=False)
+
+
+def rtt_exchange(data, buffer_index, timeout_ms, *, data_b64, reply_size):
+    """Write once and consume a bounded fixed-length reply using one deadline."""
+    reply = bytearray()
+    written = 0
+    try:
+        index, timeout = _options(buffer_index, timeout_ms)
+        if not 1 <= reply_size <= 65536 or timeout == 0:
+            raise JLinkMCPError(JLinkErrorCode.INVALID_PARAMETER, 'exchange 需要 1–65536 字节应答和正超时')
+        jlink = _session()
+        deadline = time.perf_counter() + timeout / 1000
+        sent = rtt_write(data, index, timeout, data_b64=data_b64, deadline=deadline)
+        if not sent['success']:
+            return {**sent, 'bytes_read': 0, 'data_b64': ''}
+        written = sent['bytes_written']
+        # An immediate command reply can arrive between background RTT transfers.
+        # Poll briefly at 1 ms, then use the normal backoff for slow/absent replies.
+        fast_until = time.perf_counter() + 0.012
+        while len(reply) < reply_size and time.perf_counter() < deadline:
+            chunk = _read_until(jlink, index, reply_size - len(reply), deadline, fast_until=fast_until)
+            if not chunk:
+                break
+            _decoders.pop(index, None)
+            reply.extend(chunk)
+        if len(reply) != reply_size:
+            raise JLinkMCPError(JLinkErrorCode.OPERATION_TIMEOUT, 'RTT 应答未完整到达')
+        status = {'success': True, 'complete': True}
+    except Exception as exc:
+        status = _failure(exc, complete=False, retry_safe=False)
+    return {**status, 'bytes_written': written, 'bytes_read': len(reply),
+            'data_b64': base64.b64encode(reply).decode('ascii')}
 
 
 def rtt_get_status(include_driver=False):

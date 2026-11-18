@@ -58,6 +58,7 @@ class DebugService:
         self.generation = 0
         self.snapshots = {}
         self.breakpoints = {}
+        self._register_ids = None
         self.profile = None
         self.profile_identity = None
         self.image_match = {"status": "unknown", "reason": "not checked"}
@@ -88,6 +89,7 @@ class DebugService:
 
     def _invalidate(self):
         self.generation += 1
+        self._register_ids = None
         self.snapshots.clear()
         self.image_match = {"status": "unknown", "reason": "session or target state changed"}
 
@@ -230,6 +232,19 @@ class DebugService:
     def _register_name(self, name):
         return register_name(name) if self.target["architecture"] == "cortex-m" else name
 
+    def _read_register(self, name):
+        # PyLink resolves each string by enumerating the entire target register file.
+        # IDs are target-specific; register values must always come from the probe.
+        if self._register_ids is None:
+            indices = {}
+            try:
+                for index in self.probe.register_list():
+                    indices.setdefault(self.probe.register_name(index), index)
+            except Exception:
+                indices = {}  # Let drivers without enumeration resolve names themselves.
+            self._register_ids = indices
+        return self.probe.register_read(self._register_ids.get(name, name)) & 0xffffffff
+
     def _peripheral(self, name):
         device = self.target.get("svd_device")
         if not device or "." not in name:
@@ -295,8 +310,7 @@ class DebugService:
 
     def _read_one(self, item, plan, compact, data=None):
         if item.kind == "register":
-            self._halted()
-            value = self.probe.register_read(plan["name"]) & 0xFFFFFFFF
+            value = self._read_register(plan["name"])
             self._halted()
             return {"value": value}
         if item.kind == "variable" and item.require_match:
@@ -317,7 +331,15 @@ class DebugService:
         return self._read(request) if request.action == "read" else self._capture(request)
 
     def _read_blocks(self, items, plans):
-        """Group only adjacent matched variables, in caller order and within one RAM region."""
+        """Combine exact spans of matched RAM, retaining the caller's result order."""
+        if len(plans) > 1 and all(plan.get("kind") == "variable" and item.require_match
+                                  and plan["width"] == plans[0]["width"] for item, plan in zip(items, plans)):
+            ordered = sorted(plans, key=lambda plan: plan["address"])
+            base = ordered[0]["address"]
+            end = ordered[-1]["address"] + ordered[-1]["bytes"]
+            if (all(a["address"] + a["bytes"] == b["address"] for a, b in zip(ordered, ordered[1:]))
+                    and self._in_memory(base, end - base, ram_only=True)):
+                return [range(len(plans))]
         blocks = []
         start = 0
         for index in range(1, len(plans)):
@@ -338,13 +360,14 @@ class DebugService:
         timestamp = utc_now()
         shared = None
         if len(block) > 1:
-            first, last = plans[block.start], plans[block.stop - 1]
-            size = last["address"] + last["bytes"] - first["address"]
+            group = plans[block.start:block.stop]
+            base = min(plan["address"] for plan in group)
+            size = sum(plan["bytes"] for plan in group)
             try:
                 if request.consistency == "halted":
                     self._halted()
                 self._require_image_match()
-                shared = read_bytes(self.probe, first["address"], size, first["width"])
+                shared = read_bytes(self.probe, base, size, group[0]["width"])
             except Exception as exc:
                 return [dict(item=request.items[i].model_dump(), timestamp=timestamp, **error_result(exc)) for i in block]
         results = []
@@ -359,7 +382,7 @@ class DebugService:
                 else:
                     data = None
                     if shared is not None:
-                        offset = plan["address"] - first["address"]
+                        offset = plan["address"] - base
                         data = shared[offset:offset + plan["bytes"]]
                     elif request.consistency == "halted":
                         self._halted()
@@ -538,7 +561,7 @@ class DebugService:
             result["errors"].append({"item": "halt_reasons", "error": str(exc)})
         for name in ("PC", "LR", "SP", "XPSR"):
             try:
-                result["registers"][name] = self.probe.register_read(self._register_name(name)) & 0xffffffff
+                result["registers"][name] = self._read_register(self._register_name(name))
             except Exception as exc:
                 result["errors"].append({"item": name, "error": str(exc)})
         self._halted()
@@ -558,7 +581,7 @@ class DebugService:
         self._cortex_m()
         self._halted()
         address = self._execution_address(request.address, request.symbol)
-        if self.probe.register_read(self._register_name("PC")) & ~1 == address:
+        if self._read_register(self._register_name("PC")) & ~1 == address:
             return {"success": True, "completion": "already_at_target", "address": address, "stop": self._stop_context()}
         previous = set(self.breakpoints)
         bp = self._breakpoint(contracts.BreakpointAdd(action="breakpoint_set", session_id=request.session_id, address=address))
@@ -882,6 +905,9 @@ class DebugService:
             return rtt.rtt_get_status(include_driver=True)
         if request.action == "read":
             return rtt.rtt_read(request.buffer_index, request.size, request.timeout_ms, request.format)
+        if request.action == "exchange":
+            return rtt.rtt_exchange(request.text, request.buffer_index, request.timeout_ms,
+                                    data_b64=request.data_b64, reply_size=request.reply_size)
         if request.action == "capture":
             return rtt.rtt_capture(request.buffer_index, request.size, request.timeout_ms, request.output_path)
         return rtt.rtt_write(request.text, request.buffer_index, request.timeout_ms, data_b64=request.data_b64)

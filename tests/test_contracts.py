@@ -217,6 +217,30 @@ class Contracts(unittest.TestCase):
         self.assertFalse(result['success'])
         self.assertEqual(result['bytes_written'], 2)
 
+    def test_exchange_reads_only_requested_reply_and_preserves_next_frame(self):
+        self.start_rtt()
+        self.probe.rtt_write.return_value = 1
+        raw = io.BytesIO(b'ABCDE')
+        self.probe.rtt_read.side_effect = lambda index, size: raw.read(min(size, 2))
+        result = rtt.rtt_exchange('P', 0, 1000, data_b64=None, reply_size=3)
+        self.assertTrue(result['complete'])
+        self.assertEqual(base64.b64decode(result['data_b64']), b'ABC')
+        self.assertEqual(raw.read(), b'DE')
+        self.probe.rtt_write.assert_called_once_with(0, b'P')
+
+    def test_exchange_timeout_preserves_reply_prefix_and_write_failure_never_reads(self):
+        self.start_rtt()
+        self.probe.rtt_write.return_value = 1
+        with patch.object(rtt, '_read_until', side_effect=[b'A', b'']):
+            result = rtt.rtt_exchange('P', 0, 1000, data_b64=None, reply_size=2)
+        self.assertFalse(result['success'])
+        self.assertFalse(result['retry_safe'])
+        self.assertEqual((result['bytes_written'], result['bytes_read'], result['data_b64']), (1, 1, 'QQ=='))
+        self.probe.rtt_write.side_effect = RuntimeError('disconnected')
+        result = rtt.rtt_exchange('P', 0, 1000, data_b64=None, reply_size=2)
+        self.assertFalse(result['success'])
+        self.probe.rtt_read.assert_not_called()
+
     def test_rtt_full_buffer_does_not_submit_after_deadline(self):
         self.start_rtt()
         self.probe.rtt_write.return_value = 0

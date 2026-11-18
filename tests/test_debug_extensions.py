@@ -44,6 +44,45 @@ class DebugExtensionTests(unittest.TestCase):
         self.assertEqual(result['stop']['reasons'][0]['name'], 'code_breakpoint')
         self.assertEqual(result['stop']['registers']['PC'], 0x08000100)
 
+    def test_register_reads_use_target_ids_and_refresh_values(self):
+        # Some register files expose sparse IDs; a list position is not an ID.
+        self.p.register_list.return_value = [17, 42]
+        self.p.register_name.side_effect = {17: 'R14', 42: 'R15 (PC)'}.__getitem__
+        self.p.register_read.side_effect = [0x801, 0x805, 0x900]
+        read = m.ReadBatch(action='read', session_id='s', consistency='halted',
+                           items=[dict(kind='register', name='PC')])
+        self.assertEqual(self.s.read(read)['items'][0]['data']['value'], 0x801)
+        self.assertEqual(self.s.read(read)['items'][0]['data']['value'], 0x805)
+        self.p.register_list.assert_called_once()
+        self.s._invalidate()
+        self.p.register_list.return_value = [3]
+        self.p.register_name.side_effect = {3: 'R15 (PC)'}.__getitem__
+        self.assertEqual(self.s.read(read)['items'][0]['data']['value'], 0x900)
+        self.assertEqual([c.args[0] for c in self.p.register_read.call_args_list], [42, 42, 3])
+
+    def test_permuted_dense_watch_decodes_in_request_order(self):
+        self.s.symbols = Mock()
+        self.s.symbols.variable.side_effect = lambda name: dict(
+            address=0x20000000 + 4 * int(name[-1]), size=4, type=dict(kind='signed', size=4))
+        self.s.image_match = dict(status='matched')
+        self.p.memory_read.return_value = [0xffffffff, 10, 20, 30]
+        request = m.ReadBatch(action='read', session_id='s', items=['s2', 's0', 's3', 's1'])
+        result = self.s.read(request)
+        self.assertTrue(result['success'])
+        self.assertEqual([item['data']['value'] for item in result['items']], [20, -1, 30, 10])
+        self.assertEqual([item['item']['name'] for item in result['items']], ['s2', 's0', 's3', 's1'])
+        self.p.memory_read.assert_called_once_with(0x20000000, 4, nbits=32)
+
+    def test_permuted_watch_leaves_gaps_unread(self):
+        self.s.symbols = Mock()
+        self.s.symbols.variable.side_effect = lambda name: dict(
+            address=0x20000000 + 4 * int(name[-1]), size=4, type=dict(kind='unsigned', size=4))
+        self.s.image_match = dict(status='matched')
+        self.p.memory_read.side_effect = [[3], [0, 1]]
+        result = self.s.read(m.ReadBatch(action='read', session_id='s', items=['s3', 's0', 's1']))
+        self.assertTrue(result['success'])
+        self.assertEqual([c.args for c in self.p.memory_read.call_args_list], [(0x2000000c, 1), (0x20000000, 2)])
+
     def test_until_reads_matched_adjacent_variables_in_one_transfer(self):
         self.s.symbols = Mock()
         self.s.symbols.variable.side_effect = lambda name: dict(

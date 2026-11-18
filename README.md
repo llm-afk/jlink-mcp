@@ -1,4 +1,4 @@
-# J-Link MCP 0.6.5
+# J-Link MCP 0.6.6
 
 面向嵌入式调试任务的 MCP 服务。对外提供 **8 个工具**：读取与采集统一到 read，执行控制与断点统一到 control。J-Link DLL、ELF 符号解析和 SVD 是内部实现。0.6 调整了工具名与读取请求，升级后需重载 MCP 客户端；迁移见 [迁移说明](docs/MIGRATION.md)。
 
@@ -31,7 +31,7 @@ SDK 固定兼容范围 `mcp>=1.26.0,<2`；MCP 2.x 更改了 FastMCP API。ELF �
 | control | halt / resume / reset / step / wait / run_until / breakpoint_set / breakpoint_remove / breakpoint_list |
 | inspect | symbol / variable / preflight / svd / context / fault |
 | firmware | verify_image / program / verify / backup / erase_pages / erase_chip |
-| channel | RTT open / status / read / write / capture / close |
+| channel | RTT open / status / read / write / exchange / capture / close |
 
 使用提示是 `debug://guide` 资源，不占工具列表。
 
@@ -111,7 +111,7 @@ read 负责观测和记录，control 负责执行状态与断点生命周期；w
 
 read 的 snapshot/sample 直接复用 variable。运行中的多变量或结构体读取不保证一致时刻。复位、Flash 修改尝试和连接失效会清除映像匹配证据。外部工具或目标自行改写 Flash 时需要重新 verify_image。
 
-调试闭环时，可以在同一个 `items` 中按结构体布局列出要观察的成员。对于要求映像匹配、地址首尾相接、访问宽度相同且位于同一配置 RAM 区的连续变量，服务端一次读取整段，再按原顺序返回每项的值和原始字节。`sample` 在每个采样点重新读取。一次合并读取失败时，该段各项均返回错误，后续段继续读取。寄存器和显式地址读取保留逐项访问。
+调试闭环时，可以在同一个 `items` 中按观察习惯排列变量，例如先列出 d 轴反馈和目标，再列 q 轴反馈和目标。当整组变量要求映像匹配、访问宽度一致，且实际地址恰好覆盖同一 RAM 区的一段连续字节时，一次读取整段，结果按请求顺序返回。混合请求仍可合并按地址顺序首尾相接的变量。`sample` 在每个采样点重新读取。一次合并读取失败时，该段各项均返回错误，后续段继续读取。寄存器和显式地址读取保留逐项访问。
 
 ## 类型化变量写入（0.6.2）
 
@@ -205,6 +205,7 @@ read、snapshot 和 sample 可以直接在 `items` 写变量名，也可以与�
 |---|---|
 | 看日志 | `read` 默认返回 UTF-8 文本和十六进制。传 `format="text"` 只返回文本，连续读取可拼接跨包字符。默认立即轮询，`timeout_ms` 可指定等待首批数据的时间。 |
 | 读写二进制 | `read` 传 `format="base64"` 后从 `data_b64` 取原始字节。写入时提供 `data_b64` 或 `text`，单次最多 64 KiB。部分写入后继续发送未提交的后缀，失败时 `bytes_written` 是驱动已确认的字节数。目标是否已处理数据须由应用协议确认。 |
+| 命令和定长应答 | `exchange` 接受 `text` 或 `data_b64`、`reply_size` 和总 `timeout_ms`。一次调用完成发送并从同编号上行缓冲区消费接下来的应答字节，适用于专用命令通道。返回 `bytes_written`、`bytes_read` 和 `data_b64`；超时保留已读前缀，已发送命令不自动重发。 |
 | 录制数据流 | `capture` 把最多 16 MiB 写入服务端新文件，等待上限 30 秒。返回 `bytes_written`、`sha256` 和 `complete`。超时保留已采集的前缀并返回 `timed_out=true`。已存在的文件会在消费通道数据前被拒绝。 |
 
 例如，将上行通道 0 的 64 KiB 数据保存到服务端当前目录下的新文件中。
@@ -214,6 +215,8 @@ read、snapshot 和 sample 可以直接在 `items` 写变量名，也可以与�
 ```
 
 RTT 通道提供字节流。读取或采集会消费所选通道的数据，应用协议负责帧边界。连续文本读取之间如果消费了二进制数据，该通道的 UTF-8 解码状态会重新开始。
+
+日常观察几个变量，用 `read sample` 按主机时钟采样，最短请求间隔为 10 ms。要对齐 ADC 中断或电流环周期，可让固件在对应位置将选定信号、序号或时间戳写入同一 RTT 帧，再用 `channel capture` 收集。HSS 适用于保持原固件并更高频地异步观察内存的场景；当前 MCP 的 `read sample` 使用主机轮询。参见 [SEGGER J-Scope 采样模式](https://kb.segger.com/J-Scope)。
 
 ## 架构和当前范围
 

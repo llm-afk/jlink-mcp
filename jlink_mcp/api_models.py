@@ -336,7 +336,13 @@ class ChannelState(Bound):
     action: Literal["status", "close"]
 
 
-ChannelRequest = Annotated[Union[ChannelOpen, ChannelRead, ChannelCapture, ChannelWrite, ChannelState], Field(discriminator="action")]
+class ChannelExchange(ChannelWrite):
+    action: Literal["exchange"]
+    reply_size: Size = Field(description="Consume exactly this many bytes from the same RTT up-channel index")
+    timeout_ms: Annotated[int, Field(ge=1, le=30000)] = 1000
+
+
+ChannelRequest = Annotated[Union[ChannelOpen, ChannelRead, ChannelCapture, ChannelWrite, ChannelExchange, ChannelState], Field(discriminator="action")]
 
 
 # The worker and service use the same public request registry.
