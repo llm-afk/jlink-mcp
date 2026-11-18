@@ -129,10 +129,24 @@ class VariableWrite(Request):
 WriteItem = Annotated[Union[MemoryWrite, RegisterWrite, PeripheralWrite, VariableWrite], Field(discriminator="kind")]
 
 
+class ContinueTo(Request):
+    breakpoint_id: Name = Field(description="Owned execute breakpoint to reach on the next run from halt.")
+    timeout_ms: Annotated[int, Field(ge=1, le=30000)] = 1000
+    on_timeout: Literal["halt", "running"] = "halt"
+    read_on_stop: Items | None = None
+
+
 class WriteRequest(Bound):
     item: WriteItem
     verify: bool = Field(default=False, description="Explicit readback; may have peripheral read side effects")
     consistency: Literal["live", "halted"] = "halted"
+    continue_to: ContinueTo | None = Field(default=None, description="After verified typed RAM readback, run to this breakpoint and optionally read variables there.")
+
+    @model_validator(mode="after")
+    def continuation_requires_verified_variable(self):
+        if self.continue_to and (self.item.kind != "variable" or not self.verify or self.consistency != "halted"):
+            raise ValueError("continue_to requires a typed variable, verify=true and halted consistency")
+        return self
 
 
 class RunControl(Bound):
@@ -152,6 +166,10 @@ class ObserveStop(Bound):
 class WaitControl(ObserveStop):
     action: Literal["wait"]
     timeout_ms: Annotated[int, Field(ge=1, le=30000)] = 1000
+
+
+class ContinueControl(ContinueTo, Bound):
+    action: Literal["continue_to"]
 
 
 class RunUntilControl(ObserveStop):
@@ -196,7 +214,7 @@ class BreakpointList(Bound):
     action: Literal["breakpoint_list"]
 
 
-ControlRequest = Annotated[Union[RunControl, ResetControl, WaitControl, RunUntilControl,
+ControlRequest = Annotated[Union[RunControl, ResetControl, WaitControl, ContinueControl, RunUntilControl,
                                 BreakpointAdd, BreakpointRemove, BreakpointList], Field(discriminator="action")]
 
 

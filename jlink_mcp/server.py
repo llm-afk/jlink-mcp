@@ -65,6 +65,9 @@ async def write(request: WriteRequest) -> dict:
     Typed writes require a matched ELF and halted CPU. A successful verified typed
     RAM write preserves the earlier Flash match. Other submissions invalidate it.
     Readback is optional and can affect peripherals. Writes never auto-halt or retry.
+    With verify=true on a typed variable, optionally pass continue_to={breakpoint_id,
+    read_on_stop, timeout_ms} to resume after matched readback and observe the next hit.
+    Check verification and continue_to.completion independently before acting on stop.read.
     """
     return await call("write", request)
 
@@ -80,6 +83,8 @@ async def control(request: ControlRequest) -> dict:
     and selects halt/running on_timeout. Stops report reasons and PC/LR/SP/XPSR.
     Pass read_on_stop to wait/run_until to collect variables at the observed stop
     in the same call. Check completion and stop.read.success independently.
+    For repeated hits use continue_to with an owned execute breakpoint_id and read_on_stop.
+    It resumes past the current breakpoint and leaves the breakpoint installed.
     Function symbols require matched image evidence. No automatic retry/reset.
     Reset invalidates snapshots/RTT and removes owned breakpoints.
     """
@@ -132,7 +137,9 @@ def guide() -> str:
             "When image_match.status=matched, use its session_id with read(action=read, items=[...], compact=true). "
             "For an unknown name use inspect(action=find_symbol, query=...). For a struct layout use inspect(action=variable). "
             "Use read(action=hss) for running RAM scalars, channel(action=capture) for a firmware RTT stream, "
-            "and control(action=wait, read_on_stop=[...]) for values at a stop. "
+            "and control(action=wait, read_on_stop=[...]) to observe an existing stop. For repeated hits use "
+            "control(action=continue_to, breakpoint_id=..., read_on_stop=[...]). A verified typed write can take "
+            "the same continue_to options to check values after the firmware executes. "
             "After losing context use session(action=status, compact=true) and check meta.target and meta.session_id. "
             "Inspect full session status for image comparison details. Never replay an uncertain write.")
 

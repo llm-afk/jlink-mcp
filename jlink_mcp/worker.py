@@ -66,6 +66,8 @@ class DriverWorker:
 
     @staticmethod
     def deadline(method, request):
+        if method == "write" and getattr(request, "continue_to", None):
+            return 20.0 + DriverWorker.deadline("control", request.continue_to)
         if method == "session" and getattr(request, "verify_image", False):
             return 140.0  # Open plus the independent Flash comparison budget.
         if method == "firmware":

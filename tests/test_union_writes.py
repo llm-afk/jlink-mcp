@@ -167,6 +167,71 @@ class UnionWriteTests(unittest.TestCase):
         self.assertEqual(blocked['error']['code'], 'IMAGE_NOT_MATCHED')
         self.probe.memory_write.assert_called_once()
 
+    def test_verified_write_to_next_hit_reads_after_execution(self):
+        self.match_image()
+        self.service.breakpoints['tick'] = dict(kind='execute', address=0x08000010)
+        self.probe.register_read.return_value = 0x08000010
+        self.probe.cpu_halt_reasons.return_value = [SimpleNamespace(HaltReason=1, Index=0)]
+        self.probe.restart.side_effect = lambda **kw: self.ram.__setitem__(0x44, 8) or True
+        result = self.write('packet.payload.u32', 7, verify=True, continue_to=dict(
+            breakpoint_id='tick', read_on_stop=['packet.payload.u32']))
+        self.assertTrue(result['success'], result)
+        self.assertEqual(result['observed'], '07000000')
+        after = result['continue_to']
+        self.assertEqual(after['completion'], 'target_reached')
+        self.assertEqual(after['stop']['read']['items'][0]['data']['value'], 8)
+        self.probe.restart.assert_called_once_with(skip_breakpoints=True)
+        self.probe.breakpoint_clear.assert_not_called()
+
+    def test_invalid_followup_rejected_before_write(self):
+        self.match_image()
+        self.service.breakpoints['tick'] = dict(kind='execute', address=0x08000010)
+        for opts in [dict(breakpoint_id='missing'), dict(breakpoint_id='tick', read_on_stop=['bad_member'])]:
+            result = self.write('counter', 7, verify=True, continue_to=opts)
+            self.assertEqual(result['completion'], 'not_submitted')
+        with self.assertRaises(ValidationError):
+            self.write('counter', 7, continue_to=dict(breakpoint_id='tick'))
+        self.probe.memory_write.assert_not_called()
+        self.probe.restart.assert_not_called()
+
+    def test_mismatched_write_never_continues(self):
+        self.match_image()
+        self.service.breakpoints['tick'] = dict(kind='execute', address=0x08000010)
+        self.probe.memory_write.side_effect = lambda *args, **kw: 4
+        result = self.write('counter', 7, verify=True, continue_to=dict(breakpoint_id='tick'))
+        self.assertEqual(result['verification'], 'mismatch')
+        self.assertEqual(result['continue_to']['completion'], 'not_submitted')
+        self.probe.restart.assert_not_called()
+
+    def test_verified_write_preserved_on_continue_timeout(self):
+        self.match_image()
+        self.service.breakpoints['tick'] = dict(kind='execute', address=0x08000010)
+        with patch.object(self.service, '_wait_halt', return_value=False):
+            result = self.write('counter', 7, verify=True, continue_to=dict(breakpoint_id='tick', on_timeout='running'))
+        self.assertFalse(result['success'])
+        self.assertEqual(result['verification'], 'matched')
+        self.assertEqual(result['continue_to']['completion'], 'timeout')
+        self.assertNotIn('stop', result['continue_to'])
+        self.assertFalse(result['retry_safe'])
+        self.probe.memory_write.assert_called_once()
+        self.probe.halt.assert_not_called()
+
+    def test_speed_drift_before_continuation_preserves_write_receipt(self):
+        self.match_image()
+        self.service.breakpoints['tick'] = dict(kind='execute', address=0x08000010)
+        self.service.target['requested_speed_khz'] = self.probe.speed = 10000
+        def slow_after_write(*args, **kwargs):
+            self.probe.speed = 2000
+            return self.write_memory(*args, **kwargs)
+        self.probe.memory_write.side_effect = slow_after_write
+        result = self.write('counter', 7, verify=True, continue_to=dict(breakpoint_id='tick'))
+        self.assertFalse(result['success'])
+        self.assertEqual(result['error']['code'], 'SPEED_MISMATCH')
+        self.assertEqual(result['verification'], 'matched')
+        self.assertEqual(result['continue_to']['completion'], 'not_submitted')
+        self.assertEqual(result['elf_match_after'], 'unknown')
+        self.probe.restart.assert_not_called()
+
     def test_preflight_rejection_preserves_evidence_and_never_submits(self):
         proof = self.match_image()
         for name, value in [('readonly_packet.payload.u32', 1), ('packet.payload.u32', -1)]:

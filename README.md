@@ -1,4 +1,4 @@
-# J-Link MCP 0.7.1
+# J-Link MCP 0.7.2
 
 面向嵌入式调试任务的 MCP 服务。对外提供 **8 个工具**：读取与采集统一到 read，执行控制与断点统一到 control。J-Link DLL、ELF 符号解析和 SVD 是内部实现。0.6 调整了工具名与读取请求，升级后需重载 MCP 客户端；迁移见 [迁移说明](docs/MIGRATION.md)。
 
@@ -28,7 +28,7 @@ SDK 固定兼容范围 `mcp>=1.26.0,<2`；MCP 2.x 更改了 FastMCP API。ELF �
 | session | open / status / close |
 | read | read / snapshot / diff / sample；hss 用探针高速采集运行中的 RAM 标量 |
 | write | 单次 memory / register / peripheral / variable 写入，可显式校验 |
-| control | halt / resume / reset / step / wait / run_until / breakpoint_set / breakpoint_remove / breakpoint_list |
+| control | halt / resume / reset / step / wait / run_until / continue_to / breakpoint_set / breakpoint_remove / breakpoint_list |
 | inspect | find_symbol / symbol / variable / preflight / svd / context / fault |
 | firmware | verify_image / program / verify / backup / erase_pages / erase_chip |
 | channel | RTT open / status / read / write / exchange / capture / close |
@@ -148,6 +148,15 @@ read 的 snapshot/sample 直接复用 variable。运行中的多变量或结构�
 ## 等待、现场定位和数据观察点
 
 `wait` 和 `run_until` 的可选字段 `read_on_stop` 接受与 `read.items` 相同的列表。观察到停机后，同一次请求会返回 `stop.read`，其中包含紧凑的逐项结果。用 `completion` 区分命中目标、停在其他位置和超时，再用 `stop.read.success` 判断读取是否成功。超时后按配置暂停也可以取值；目标继续运行时跳过读取。
+
+反复观察同一函数时，先在已暂停的会话用 `control breakpoint_set` 创建执行断点并保留 ID。下面两个请求分别发给 `control` 和 `write`。第一个请求继续到断点并读取原值，第二个请求修改 RAM、回读校验，再让固件运行到下一次命中并观察。这两个操作都保留断点，结束时用 `breakpoint_remove` 移除。
+
+```json
+{"request":{"action":"continue_to","session_id":"会话ID","breakpoint_id":"断点ID","read_on_stop":["ODObjs.heartbeat_producer_time","SystickCount"]}}
+{"request":{"session_id":"会话ID","item":{"kind":"variable","name":"ODObjs.heartbeat_producer_time","value":1001},"verify":true,"continue_to":{"breakpoint_id":"断点ID","read_on_stop":["ODObjs.heartbeat_producer_time","SystickCount"]}}}
+```
+
+`write.continue_to` 只接受已暂停时的类型化 RAM 写入。写前检查断点和观察项，写后回读匹配才继续执行。同一回复的 `verification` 描述写入，`continue_to.completion` 描述停机位置，`continue_to.stop.read` 给出该处的值。后续超时或读失败时应保留已确认的写入结果，避免重复提交。默认超时会暂停，传 `on_timeout="running"` 可让目标继续运行。命中目标后 CPU 保持暂停。
 
 `control wait` 只等待 CPU 停止，最长 30 秒，不继续、不暂停、不复位。返回停止原因（调试请求、代码断点、数据观察点或向量捕获）、原始原因码和 PC/LR/SP/XPSR；原因读取失败会保留错误，不推断原因。
 

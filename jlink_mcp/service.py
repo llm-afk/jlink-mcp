@@ -114,6 +114,7 @@ class DebugService:
             started, timestamp = time.perf_counter(), utc_now()
             before = "unknown"
             authorized = False
+            result = {}
             try:
                 if method != "discover" and method not in contracts.TOOL_REQUESTS:
                     raise ServiceError("UNKNOWN_TOOL", "Use a tool from the current tools/list")
@@ -128,7 +129,12 @@ class DebugService:
                     self._verify_speed()
             except Exception as exc:
                 rejected = isinstance(exc, WriteNotSubmitted)
-                result = error_result(exc.__cause__ if rejected else exc)
+                failure = error_result(exc.__cause__ if rejected else exc)
+                if method == "write" and "continue_to" in result:
+                    # A final speed check can fail after the verified write has already completed.
+                    result.update(failure, elf_match_after=self.image_match["status"])
+                else:
+                    result = failure
                 if method in ("write", "control", "firmware"):
                     if not authorized or rejected:
                         result.update(submitted=False, completion="not_submitted")
@@ -148,7 +154,7 @@ class DebugService:
                 "typed_write": "halted, matched ELF, profiled RAM; scalar or fixed 1D scalar array; named union paths",
                 "execution_debug": self.target is not None and self.target["architecture"] == "cortex-m",
                 "read_actions": ["read", "snapshot", "diff", "sample", "hss"], "channel": "RTT",
-                "control": ["halt", "resume", "reset", "step", "wait", "run_until",
+                "control": ["halt", "resume", "reset", "step", "wait", "run_until", "continue_to",
                             "breakpoint_set", "breakpoint_remove", "breakpoint_list"],
                 "breakpoint_kinds": ["execute", "read", "write", "access"],
                 "context": "Cortex-M halted registers, stop reasons, ELF source mapping and Thumb disassembly",
@@ -499,6 +505,11 @@ class DebugService:
         item = request.item
         variable = None
         try:
+            if request.continue_to:
+                destination = self._owned_execution_address(request.continue_to.breakpoint_id)
+                plans = [self._plan_read(watch) for watch in request.continue_to.read_on_stop or []]
+                if sum(plan["bytes"] for plan in plans) > 65536:
+                    raise ServiceError("LIMIT", "Total stop read size must not exceed 64KB")
             if item.kind in ("register", "variable") and request.consistency != "halted":
                 raise ServiceError("REQUIRES_HALT", "Register and typed writes require halted consistency")
             if request.consistency == "halted":
@@ -536,6 +547,20 @@ class DebugService:
             result.update(variable={**variable, "elf_sha256": self.symbols.sha256},
                           data_hex=data.hex(), value=decode(variable["type"], data),
                           elf_match_after=self.image_match["status"])
+        if request.continue_to:
+            result["retry_safe"] = False
+            if not result["success"]:
+                result["continue_to"] = {"success": False, "completion": "not_submitted"}
+                return result
+            try:
+                self._require_image_match()
+                self._verify_speed()
+                follow = self._continue_to(request.continue_to, destination, plans)
+            except Exception as exc:
+                follow = {**error_result(exc), "completion": "not_submitted"}
+            result["continue_to"] = follow
+            result["elf_match_after"] = self.image_match["status"]
+            result["success"] = follow["success"] and follow.get("stop", {}).get("read", {}).get("success", True)
         return result
 
     def _cortex_m(self):
@@ -545,6 +570,8 @@ class DebugService:
     def control(self, request):
         if isinstance(request, (contracts.BreakpointAdd, contracts.BreakpointRemove, contracts.BreakpointList)):
             return self._breakpoint(request)
+        if request.action == "continue_to":
+            return self._continue_to(request, self._owned_execution_address(request.breakpoint_id))
         if request.action in ("wait", "run_until"):
             if request.action == "wait":
                 stopped = self._wait_halt(request.timeout_ms)
@@ -552,12 +579,7 @@ class DebugService:
                           "stop": self._stop_context() if stopped else None}
             else:
                 result = self._run_until(request)
-            if request.read_on_stop and result.get("stop"):
-                try:
-                    result["stop"]["read"] = self._read(contracts.ReadBatch(action="read", session_id=request.session_id,
-                        consistency="halted", compact=True, items=request.read_on_stop))
-                except Exception as exc:
-                    result["stop"]["read"] = error_result(exc)
+            self._read_at_stop(result, request.read_on_stop)
             return result
         if request.action == "reset":
             if request.mode == "core":
@@ -639,9 +661,52 @@ class DebugService:
         previous = set(self.breakpoints)
         bp = self._breakpoint(contracts.BreakpointAdd(action="breakpoint_set", session_id=request.session_id, address=address))
         key = bp["breakpoint_id"]
+        result = {}
+        try:
+            result.update(self._run_to_address(request, address, overstep=False))
+        finally:
+            if key not in previous:
+                try:
+                    self._clear_breakpoint(key)
+                    result["temporary_breakpoint_removed"] = True
+                except Exception as exc:
+                    result.update(success=False, temporary_breakpoint_removed=False,
+                                  cleanup_error=str(exc), remaining_breakpoint_id=key)
+            else:
+                result["reused_breakpoint_id"] = key
+        return result
+
+    def _owned_execution_address(self, key):
+        self._cortex_m()
+        bp = self.breakpoints.get(key)
+        if bp is None or bp.get("kind") != "execute":
+            raise ServiceError("INVALID_BREAKPOINT", "continue_to requires an execute breakpoint_id owned by this session")
+        return bp["address"]
+
+    def _read_at_stop(self, result, items, plans=None):
+        if items and result.get("stop"):
+            try:
+                batch = contracts.ReadBatch(action="read", session_id=self.session_id, consistency="halted",
+                                            compact=True, items=items)
+                result["stop"]["read"] = self._read(batch, plans)
+            except Exception as exc:
+                result["stop"]["read"] = error_result(exc)
+
+    def _continue_to(self, request, address, plans=None):
+        self._halted()
+        result = self._run_to_address(request, address, overstep=True)
+        result["breakpoint_id"] = request.breakpoint_id
+        self._read_at_stop(result, request.read_on_stop, plans)
+        return result
+
+    def _run_to_address(self, request, address, overstep):
         result = {"success": False, "address": address, "on_timeout": request.on_timeout}
         try:
-            self.probe.restart()
+            if overstep:
+                if not self.probe.restart(skip_breakpoints=True):
+                    raise ServiceError("NOT_RESTARTED", "Probe did not restart the halted target")
+            else:
+                self.probe.restart()
             stopped = self._wait_halt(request.timeout_ms)
             if not stopped and request.on_timeout == "halt":
                 self.probe.halt()
@@ -656,16 +721,6 @@ class DebugService:
             result.update(success=hit, completion="target_reached" if hit else "stopped_elsewhere" if stopped else "timeout")
         except Exception as exc:
             result.update(error_result(exc), completion="unknown", retry_safe=False)
-        finally:
-            if key not in previous:
-                try:
-                    self._clear_breakpoint(key)
-                    result["temporary_breakpoint_removed"] = True
-                except Exception as exc:
-                    result.update(success=False, temporary_breakpoint_removed=False,
-                                  cleanup_error=str(exc), remaining_breakpoint_id=key)
-            else:
-                result["reused_breakpoint_id"] = key
         return result
 
     def _breakpoint(self, request):

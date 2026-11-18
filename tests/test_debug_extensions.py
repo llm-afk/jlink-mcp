@@ -178,6 +178,18 @@ class DebugExtensionTests(unittest.TestCase):
         self.assertIn(result['reused_breakpoint_id'], self.s.breakpoints)
         self.p.breakpoint_clear.assert_not_called()
 
+    def test_continue_requires_new_run_and_reports_foreign_stop(self):
+        key = self.s.control(m.BreakpointAdd(session_id='s', action='breakpoint_set', address=0x08000200))['breakpoint_id']
+        req = m.ContinueControl(session_id='s', action='continue_to', breakpoint_id=key)
+        result = self.s.control(req)
+        self.assertEqual(result['completion'], 'stopped_elsewhere')
+        self.p.restart.assert_called_once_with(skip_breakpoints=True)
+        self.p.restart.return_value = False
+        result = self.s.control(req)
+        self.assertFalse(result['success'])
+        self.assertEqual(result['error']['code'], 'NOT_RESTARTED')
+        self.p.breakpoint_clear.assert_not_called()
+
     def test_timeout_policy_halt(self):
         with patch.object(self.s, '_wait_halt', side_effect=[False, True]):
             result = self.until(on_timeout='halt')
